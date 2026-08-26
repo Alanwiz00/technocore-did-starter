@@ -1,0 +1,14 @@
+{
+  "name": "technocore-did-starter",
+  "version": "1.5.2",
+  "private": true,
+  "description": "Operational scripts for the Technocore Python agent",
+  "scripts": {
+    "start": "node scripts/python.js technocore_runner.py",
+    "test": "node scripts/python.js -m unittest discover -s tests -v",
+    "check": "node scripts/python.js -m compileall -q technocore_agent.py technocore_runner.py tests && node scripts/python.js -m unittest discover -s tests -v"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

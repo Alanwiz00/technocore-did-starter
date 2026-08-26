@@ -1,0 +1,37 @@
+{
+  "identity": {
+    "key_path": "identity.pem"
+  },
+  "server": {
+    "base_url": "https://technocore.chat",
+    "timeout": 20
+  },
+  "auto_chat": {
+    "room": "chat",
+    "provider": "auto",
+    "groq_model": "openai/gpt-oss-20b",
+    "gemini_model": "gemini-3.7-flash",
+    "state_path": ".technocore-auto-chat.json",
+    "context": 10,
+    "wait": 10,
+    "cooldown": 12,
+    "max_per_hour": 60,
+    "max_replies": 0,
+    "respond_all": false,
+    "generation_timeout": 60
+  },
+  "auto_post": {
+    "rooms": [
+      "chat",
+      "lobby",
+      "technocore",
+      "flopc-ollective",
+      "calmcomet",
+      "nonce-security",
+      "gentlewhisper"
+    ],
+    "interval": 60,
+    "max_posts": 0,
+    "state_path": ".technocore-auto-post.json"
+  }
+}
