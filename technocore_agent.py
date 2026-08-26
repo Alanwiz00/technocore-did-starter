@@ -29,7 +29,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import (
     Ed25519PublicKey,
 )
 
-APP_VERSION = "1.5.2"
+APP_VERSION = "1.5.3"
 DEFAULT_BASE_URL = "https://technocore.chat"
 DEFAULT_KEY_PATH = Path("identity.pem")
 DEFAULT_TIMEOUT_SECONDS = 20.0
@@ -898,7 +898,10 @@ def validate_generated_reply(value: Any) -> str:
     """Normalize provider output and enforce a short public-chat response."""
     if not isinstance(value, str):
         raise NetworkError("generation provider returned non-text content")
-    normalized = normalize_message(value)
+    try:
+        normalized = normalize_message(value)
+    except ProtocolError as error:
+        raise NetworkError(f"generation provider returned invalid text: {error}") from error
     if len(normalized) > 500:
         normalized = normalized[:500].rstrip()
     if not normalized:
@@ -930,7 +933,7 @@ def choose_auto_reply(
     for name, generate in attempts:
         try:
             return generate(), name
-        except NetworkError as error:
+        except (NetworkError, ProtocolError) as error:
             print(f"warning: {error}; trying fallback", file=sys.stderr)
     return random.SystemRandom().choice(FALLBACK_REPLIES), "template"
 
@@ -1136,17 +1139,16 @@ def run_auto_chat(private_key: Ed25519PrivateKey, args: argparse.Namespace) -> i
                 recent_context, args.provider, args.groq_model,
                 args.gemini_model, args.generation_timeout
             )
-            print(
-                json.dumps(
-                    {"reply_to": message["seq"], "source": source, "text": reply},
-                    ensure_ascii=True,
-                ),
-                flush=True,
-            )
             proposed += 1
             rate_times.append(now)
+            result = {
+                "reply_to": message["seq"],
+                "source": source,
+                "text": reply,
+                "status": "preview",
+            }
             if args.send:
-                post_signed_message(
+                posted_response = post_signed_message(
                     private_key,
                     args.room,
                     reply,
@@ -1157,6 +1159,14 @@ def run_auto_chat(private_key: Ed25519PrivateKey, args: argparse.Namespace) -> i
                 sent += 1
                 state["last_seq"] = cursor
                 save_auto_state(args.state, state)
+                result.update(
+                    {
+                        "status": "posted",
+                        "seq": posted_response["posted"]["seq"],
+                        "nonce": posted_response["posted"]["nonce"],
+                    }
+                )
+            print(json.dumps(result, ensure_ascii=True), flush=True)
         state["last_seq"] = cursor
         save_auto_state(args.state, state)
         completed = sent if args.send else proposed

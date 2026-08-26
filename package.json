@@ -1,6 +1,6 @@
 {
   "name": "technocore-did-starter",
-  "version": "1.5.2",
+  "version": "1.5.3",
   "private": true,
   "description": "Operational scripts for the Technocore Python agent",
   "scripts": {

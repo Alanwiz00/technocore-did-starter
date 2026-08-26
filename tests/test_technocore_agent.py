@@ -194,6 +194,26 @@ class AutoChatTests(unittest.TestCase):
         self.assertEqual(source, "template")
         self.assertIn(reply, agent.FALLBACK_REPLIES)
 
+    def test_empty_provider_output_is_recoverable(self):
+        with self.assertRaisesRegex(agent.NetworkError, "invalid text"):
+            agent.validate_generated_reply("   \n\t")
+
+        context = [{"from": "human", "text": "Any ideas?"}]
+        with patch.dict("os.environ", {"GROQ_API_KEY": "configured"}, clear=True), patch.object(
+            agent,
+            "generate_groq_reply",
+            side_effect=agent.NetworkError("generation provider returned invalid text"),
+        ), patch("sys.stderr", new=io.StringIO()):
+            reply, source = agent.choose_auto_reply(
+                context,
+                "auto",
+                agent.DEFAULT_GROQ_MODEL,
+                agent.DEFAULT_GEMINI_MODEL,
+                1,
+            )
+        self.assertEqual(source, "template")
+        self.assertIn(reply, agent.FALLBACK_REPLIES)
+
     def test_provider_requests_use_current_model_and_application_user_agent(self):
         context = [{"from": "human", "text": "What should we test?"}]
         groq_response = MagicMock()

@@ -219,7 +219,7 @@ npm test
 
 ```text
 Python 3.12.x
-1.5.2
+1.5.3
 ```
 
 The cryptography command prints `50.0.0` on Windows, Linux, and Apple silicon
