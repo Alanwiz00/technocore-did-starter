@@ -154,6 +154,53 @@ class NetworkTests(unittest.TestCase):
             with self.assertRaisesRegex(agent.NetworkError, "redirects are refused"):
                 agent.request_json(Request("https://technocore.chat/r/lobby"), 1)
 
+    def test_retryable_read_error_preserves_server_backoff(self):
+        body = json.dumps({"retry_after": 60, "detail": "origin overloaded"}).encode()
+        error = HTTPError(
+            "https://technocore.chat/r/chat",
+            502,
+            "Bad Gateway",
+            {},
+            io.BytesIO(body),
+        )
+        with patch.object(agent.HTTP_OPENER, "open", side_effect=error):
+            with self.assertRaises(agent.RetryableNetworkError) as raised:
+                agent.request_json(Request("https://technocore.chat/r/chat"), 1)
+        self.assertEqual(raised.exception.retry_after, 60)
+
+    def test_signed_write_error_is_never_marked_retryable(self):
+        error = HTTPError(
+            "https://technocore.chat/r/chat",
+            502,
+            "Bad Gateway",
+            {},
+            io.BytesIO(b'{"retry_after":60}'),
+        )
+        with patch.object(agent.HTTP_OPENER, "open", side_effect=error):
+            with self.assertRaises(agent.NetworkError) as raised:
+                agent.request_json(
+                    Request("https://technocore.chat/r/chat"), 1, is_write=True
+                )
+        self.assertNotIsInstance(raised.exception, agent.RetryableNetworkError)
+
+    def test_follow_room_resumes_after_retryable_read_error(self):
+        did = agent.did_from_private_key(Ed25519PrivateKey.generate())
+        response = {
+            "room": "chat",
+            "count": 1,
+            "last_seq": 11,
+            "messages": [
+                {"seq": 11, "from": did, "text": "hello", "nonce": 11}
+            ],
+        }
+        retryable = agent.RetryableNetworkError("temporary failure", 2)
+        with patch.object(
+            agent, "read_room", side_effect=[retryable, response]
+        ), patch.object(agent.time, "sleep") as sleep, patch("sys.stderr", new=io.StringIO()):
+            followed = agent.follow_room("chat", since=10, wait=1, timeout=2)
+            self.assertEqual(next(followed), response)
+        sleep.assert_called_once_with(2)
+
     def test_proof_file_size_limit(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "proof.json"
@@ -246,6 +293,57 @@ class AutoChatTests(unittest.TestCase):
         self.assertIn("gemini-3.7-flash", gemini_request.full_url)
         self.assertIn(b'"thinkingLevel":"low"', gemini_request.data)
         self.assertIn(b'"maxOutputTokens":512', gemini_request.data)
+
+    def test_openai_response_request_and_nested_output(self):
+        context = [{"from": "human", "text": "What should we test?"}]
+        response = MagicMock()
+        response.__enter__.return_value.read.return_value = json.dumps(
+            {
+                "output": [
+                    {"content": [{"type": "output_text", "text": "Test fallback routing."}]}
+                ]
+            }
+        ).encode()
+        with patch.object(agent.HTTP_OPENER, "open", return_value=response) as opened:
+            reply = agent.generate_openai_reply(
+                context, "secret", agent.DEFAULT_OPENAI_MODEL, 1
+            )
+        request = opened.call_args.args[0]
+        self.assertEqual(reply, "Test fallback routing.")
+        self.assertEqual(request.full_url, "https://api.openai.com/v1/responses")
+        self.assertIn(b'"model":"gpt-5.4-mini"', request.data)
+        self.assertIn(b'"store":false', request.data)
+
+    def test_auto_provider_uses_twelve_hour_schedule_and_fallback(self):
+        context = [{"from": "human", "text": "Any ideas?"}]
+        keys = {
+            "GROQ_API_KEY": "groq",
+            "GEMINI_API_KEY": "gemini",
+            "OPENAI_API_KEY": "openai",
+        }
+        with patch.dict("os.environ", keys, clear=True), patch.object(
+            agent, "generate_groq_reply", side_effect=agent.NetworkError("groq limit")
+        ), patch.object(
+            agent, "generate_gemini_reply", side_effect=agent.NetworkError("gemini limit")
+        ), patch.object(
+            agent, "generate_openai_reply", return_value="OpenAI fallback"
+        ) as openai, patch("sys.stderr", new=io.StringIO()):
+            reply, source = agent.choose_auto_reply(
+                context, "auto", agent.DEFAULT_GROQ_MODEL,
+                agent.DEFAULT_GEMINI_MODEL, 1, utc_hour=2
+            )
+        self.assertEqual((reply, source), ("OpenAI fallback", "openai"))
+        openai.assert_called_once()
+
+        with patch.dict("os.environ", keys, clear=True), patch.object(
+            agent, "generate_openai_reply", return_value="OpenAI scheduled"
+        ) as openai:
+            reply, source = agent.choose_auto_reply(
+                context, "auto", agent.DEFAULT_GROQ_MODEL,
+                agent.DEFAULT_GEMINI_MODEL, 1, utc_hour=13
+            )
+        self.assertEqual((reply, source), ("OpenAI scheduled", "openai"))
+        openai.assert_called_once()
 
     def test_auto_state_round_trip(self):
         with tempfile.TemporaryDirectory() as directory:

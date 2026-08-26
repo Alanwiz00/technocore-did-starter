@@ -16,6 +16,7 @@ import sys
 import time
 import unicodedata
 from collections.abc import Callable, Iterator
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -29,18 +30,21 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import (
     Ed25519PublicKey,
 )
 
-APP_VERSION = "1.5.3"
+APP_VERSION = "1.6.0"
 DEFAULT_BASE_URL = "https://technocore.chat"
 DEFAULT_KEY_PATH = Path("identity.pem")
 DEFAULT_TIMEOUT_SECONDS = 20.0
 DEFAULT_FOLLOW_WAIT_SECONDS = 10.0
-DEFAULT_AUTO_COOLDOWN_SECONDS = 12.0
-DEFAULT_AUTO_MAX_PER_HOUR = 60
+DEFAULT_AUTO_COOLDOWN_SECONDS = 300.0
+DEFAULT_AUTO_MAX_PER_HOUR = 12
 DEFAULT_AUTO_STATE_PATH = Path(".technocore-auto-chat.json")
 DEFAULT_AUTO_POST_STATE_PATH = Path(".technocore-auto-post.json")
-DEFAULT_AUTO_POST_INTERVAL_SECONDS = 60.0
+DEFAULT_AUTO_POST_INTERVAL_SECONDS = 900.0
 DEFAULT_GROQ_MODEL = "openai/gpt-oss-20b"
 DEFAULT_GEMINI_MODEL = "gemini-3.7-flash"
+DEFAULT_OPENAI_MODEL = "gpt-5.4-mini"
+DEFAULT_PRIMARY_PROVIDER_HOURS = 12
+DEFAULT_PROVIDER_COOLDOWN_SECONDS = 60.0
 DEFAULT_CONFIG_PATH = Path("technocore.config.json")
 MIN_FOLLOW_INTERVAL_SECONDS = 0.5
 MAX_MESSAGE_CHARS = 4096
@@ -51,6 +55,7 @@ MAX_PROOF_BYTES = 1024 * 1024
 MULTICODEC_ED25519 = b"\xed\x01"
 MULTIBASE_LENGTH = 48
 SIGNATURE_LENGTH = 86
+PROVIDER_COOLDOWNS: dict[str, float] = {}
 
 BASE58BTC_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 BASE58BTC_INDEX = {
@@ -92,7 +97,8 @@ CONFIG_FIELDS = {
         {
             "room", "provider", "groq_model", "gemini_model", "state_path",
             "context", "wait", "cooldown", "max_per_hour", "max_replies",
-            "respond_all", "generation_timeout",
+            "respond_all", "generation_timeout", "openai_model",
+            "primary_provider_hours",
         }
     ),
     "auto_post": frozenset({"rooms", "interval", "max_posts", "state_path"}),
@@ -109,6 +115,22 @@ class ProtocolError(ValueError):
 
 class NetworkError(RuntimeError):
     """A Technocore HTTP request failed or returned an invalid response."""
+
+
+class RetryableNetworkError(NetworkError):
+    """A read request may be safely retried after a bounded delay."""
+
+    def __init__(self, message: str, retry_after: float) -> None:
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
+class ProviderNetworkError(NetworkError):
+    """A generation provider failed and should be cooled down temporarily."""
+
+    def __init__(self, message: str, retry_after: float = DEFAULT_PROVIDER_COOLDOWN_SECONDS) -> None:
+        super().__init__(message)
+        self.retry_after = retry_after
 
 
 class LocalFileError(RuntimeError):
@@ -533,6 +555,24 @@ def request_json(
             raise NetworkError(
                 f"Technocore returned redirect HTTP {error.code}; redirects are refused"
             ) from None
+        if not is_write and (error.code == 429 or 500 <= error.code <= 599):
+            retry_after = 5.0
+            try:
+                error_payload = json.loads(raw_error.decode("utf-8"))
+                candidate = error_payload.get("retry_after")
+                if isinstance(candidate, (int, float)) and not isinstance(candidate, bool):
+                    retry_after = float(candidate)
+            except (UnicodeDecodeError, json.JSONDecodeError, AttributeError):
+                header_value = error.headers.get("Retry-After") if error.headers else None
+                try:
+                    retry_after = float(header_value)
+                except (TypeError, ValueError):
+                    pass
+            retry_after = min(300.0, max(1.0, retry_after))
+            raise RetryableNetworkError(
+                f"Technocore returned retryable HTTP {error.code}: {detail}",
+                retry_after,
+            ) from None
         raise NetworkError(f"Technocore returned HTTP {error.code}: {detail}") from None
     except URLError as error:
         if isinstance(error.reason, TimeoutError):
@@ -746,15 +786,24 @@ def follow_room(
     cache_buster = 0
     while True:
         request_started = time.monotonic()
-        response = read_room(
-            room,
-            since=cursor,
-            limit=limit,
-            wait=selected_wait,
-            cache_buster=cache_buster,
-            base_url=base_url,
-            timeout=timeout,
-        )
+        try:
+            response = read_room(
+                room,
+                since=cursor,
+                limit=limit,
+                wait=selected_wait,
+                cache_buster=cache_buster,
+                base_url=base_url,
+                timeout=timeout,
+            )
+        except RetryableNetworkError as error:
+            print(
+                f"warning: {error}; retrying read in {error.retry_after:g} seconds",
+                file=sys.stderr,
+                flush=True,
+            )
+            time.sleep(error.retry_after)
+            continue
         cache_buster += 1
         if response["messages"]:
             next_cursor = response["last_seq"]
@@ -783,9 +832,20 @@ def request_external_json(
             raw_error[:MAX_ERROR_RESPONSE_BYTES].decode("utf-8", errors="replace")
             or error.reason
         )
-        raise NetworkError(f"{provider} returned HTTP {error.code}: {detail}") from None
+        retry_after = DEFAULT_PROVIDER_COOLDOWN_SECONDS
+        header = error.headers.get("Retry-After") if error.headers else None
+        if header:
+            try:
+                retry_after = max(1.0, min(float(header), 3600.0))
+            except ValueError:
+                pass
+        raise ProviderNetworkError(
+            f"{provider} returned HTTP {error.code}: {detail}", retry_after
+        ) from None
     except (URLError, TimeoutError, OSError) as error:
-        raise NetworkError(f"{provider} request failed: {terminal_safe_detail(error)}") from error
+        raise ProviderNetworkError(
+            f"{provider} request failed: {terminal_safe_detail(error)}"
+        ) from error
     if len(raw_body) > MAX_RESPONSE_BYTES:
         raise NetworkError(f"{provider} response exceeded the safety limit")
     try:
@@ -894,6 +954,52 @@ def generate_gemini_reply(
     return validate_generated_reply(content)
 
 
+def generate_openai_reply(
+    context: list[dict[str, Any]], api_key: str, model: str, timeout: float
+) -> str:
+    """Generate one reply with OpenAI's Responses API."""
+    transcript = "\n".join(
+        f"<{message['from']}> {message['text']}" for message in context[-10:]
+    )
+    body = json.dumps(
+        {
+            "model": model,
+            "instructions": AUTO_SYSTEM_PROMPT,
+            "input": f"Recent room transcript:\n{transcript}",
+            "max_output_tokens": 256,
+            "store": False,
+        },
+        separators=(",", ":"),
+    ).encode("utf-8")
+    request = Request(
+        "https://api.openai.com/v1/responses",
+        data=body,
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "User-Agent": f"technocore-did-starter/{APP_VERSION}",
+        },
+    )
+    response = request_external_json(request, timeout, "OpenAI")
+    content = response.get("output_text")
+    if not isinstance(content, str):
+        texts: list[str] = []
+        for output in response.get("output", []):
+            if not isinstance(output, dict):
+                continue
+            for part in output.get("content", []):
+                if isinstance(part, dict) and part.get("type") == "output_text":
+                    text = part.get("text")
+                    if isinstance(text, str):
+                        texts.append(text)
+        content = "".join(texts)
+    if not content:
+        raise NetworkError("OpenAI response did not contain generated text")
+    return validate_generated_reply(content)
+
+
 def validate_generated_reply(value: Any) -> str:
     """Normalize provider output and enforce a short public-chat response."""
     if not isinstance(value, str):
@@ -911,28 +1017,51 @@ def validate_generated_reply(value: Any) -> str:
 
 def choose_auto_reply(
     context: list[dict[str, Any]], provider: str, groq_model: str,
-    gemini_model: str, timeout: float
+    gemini_model: str, timeout: float,
+    openai_model: str = DEFAULT_OPENAI_MODEL,
+    primary_provider_hours: int = DEFAULT_PRIMARY_PROVIDER_HOURS,
+    utc_hour: int | None = None,
 ) -> tuple[str, str]:
-    """Try configured providers in order and always retain a template fallback."""
+    """Route providers by UTC schedule and retain a template fallback."""
     groq_key = os.environ.get("GROQ_API_KEY", "").strip()
     gemini_key = os.environ.get("GEMINI_API_KEY", "").strip()
-    attempts: list[tuple[str, Callable[[], str]]] = []
-    if provider in {"auto", "groq"} and groq_key:
-        attempts.append(
-            ("groq", lambda: generate_groq_reply(context, groq_key, groq_model, timeout))
+    openai_key = os.environ.get("OPENAI_API_KEY", "").strip()
+    generators: dict[str, Callable[[], str]] = {}
+    if groq_key:
+        generators["groq"] = lambda: generate_groq_reply(
+            context, groq_key, groq_model, timeout
         )
-    if provider in {"auto", "gemini"} and gemini_key:
-        attempts.append(
-            (
-                "gemini",
-                lambda: generate_gemini_reply(
-                    context, gemini_key, gemini_model, timeout
-                ),
-            )
+    if gemini_key:
+        generators["gemini"] = lambda: generate_gemini_reply(
+            context, gemini_key, gemini_model, timeout
         )
+    if openai_key:
+        generators["openai"] = lambda: generate_openai_reply(
+            context, openai_key, openai_model, timeout
+        )
+    if provider == "auto":
+        hour = datetime.now(timezone.utc).hour if utc_hour is None else utc_hour
+        primary = ["groq", "gemini"] if hour % 2 == 0 else ["gemini", "groq"]
+        order = primary + ["openai"] if hour < primary_provider_hours else ["openai"] + primary
+    elif provider == "template":
+        order = []
+    else:
+        order = [provider, "openai"] if provider != "openai" else ["openai"]
+    now = time.monotonic()
+    attempts = [
+        (name, generators[name]) for name in order
+        if name in generators and PROVIDER_COOLDOWNS.get(name, 0.0) <= now
+    ]
     for name, generate in attempts:
         try:
             return generate(), name
+        except ProviderNetworkError as error:
+            PROVIDER_COOLDOWNS[name] = time.monotonic() + error.retry_after
+            print(
+                f"warning: {error}; cooling down {name} for "
+                f"{error.retry_after:g} seconds and trying fallback",
+                file=sys.stderr,
+            )
         except (NetworkError, ProtocolError) as error:
             print(f"warning: {error}; trying fallback", file=sys.stderr)
     return random.SystemRandom().choice(FALLBACK_REPLIES), "template"
@@ -1137,7 +1266,9 @@ def run_auto_chat(private_key: Ed25519PrivateKey, args: argparse.Namespace) -> i
                 continue
             reply, source = choose_auto_reply(
                 recent_context, args.provider, args.groq_model,
-                args.gemini_model, args.generation_timeout
+                args.gemini_model, args.generation_timeout,
+                getattr(args, "openai_model", DEFAULT_OPENAI_MODEL),
+                getattr(args, "primary_provider_hours", DEFAULT_PRIMARY_PROVIDER_HOURS),
             )
             proposed += 1
             rate_times.append(now)
@@ -1455,7 +1586,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=configured_default(config, "auto_chat", "room", "TECHNOCORE_AUTO_CHAT_ROOM", "chat"),
     )
     auto_parser.add_argument(
-        "--provider", choices=("auto", "groq", "gemini", "template"),
+        "--provider", choices=("auto", "groq", "gemini", "openai", "template"),
         default=configured_default(config, "auto_chat", "provider", "TECHNOCORE_AUTO_CHAT_PROVIDER", "auto"),
     )
     auto_parser.add_argument(
@@ -1463,6 +1594,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     auto_parser.add_argument(
         "--gemini-model", default=configured_default(config, "auto_chat", "gemini_model", "GEMINI_MODEL", DEFAULT_GEMINI_MODEL)
+    )
+    auto_parser.add_argument(
+        "--openai-model", default=configured_default(config, "auto_chat", "openai_model", "OPENAI_MODEL", DEFAULT_OPENAI_MODEL)
+    )
+    auto_parser.add_argument(
+        "--primary-provider-hours", type=int, choices=range(1, 24),
+        default=configured_default(config, "auto_chat", "primary_provider_hours", "TECHNOCORE_PRIMARY_PROVIDER_HOURS", DEFAULT_PRIMARY_PROVIDER_HOURS, int),
+        help="UTC hours per day reserved for alternating Groq/Gemini before OpenAI",
     )
     auto_parser.add_argument(
         "--state", type=Path,

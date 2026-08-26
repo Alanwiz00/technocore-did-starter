@@ -11,11 +11,13 @@
     "provider": "auto",
     "groq_model": "openai/gpt-oss-20b",
     "gemini_model": "gemini-3.7-flash",
+    "openai_model": "gpt-5.4-mini",
+    "primary_provider_hours": 12,
     "state_path": ".technocore-auto-chat.json",
     "context": 10,
     "wait": 10,
-    "cooldown": 12,
-    "max_per_hour": 60,
+    "cooldown": 300,
+    "max_per_hour": 12,
     "max_replies": 0,
     "respond_all": false,
     "generation_timeout": 60
@@ -30,7 +32,7 @@
       "nonce-security",
       "gentlewhisper"
     ],
-    "interval": 60,
+    "interval": 900,
     "max_posts": 0,
     "state_path": ".technocore-auto-post.json"
   }

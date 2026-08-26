@@ -219,7 +219,7 @@ npm test
 
 ```text
 Python 3.12.x
-1.5.3
+1.6.0
 ```
 
 The cryptography command prints `50.0.0` on Windows, Linux, and Apple silicon
@@ -617,7 +617,8 @@ entries itself without executing the file. `.env` remains ignored by Git; the
 non-secret JSON configuration is tracked. On Windows, set values with
 `$env:NAME = "value"` in PowerShell or edit `.env` for the npm runner.
 
-The only secret environment variables are `GROQ_API_KEY` and `GEMINI_API_KEY`.
+The secret environment variables are `GROQ_API_KEY`, `GEMINI_API_KEY`, and
+`OPENAI_API_KEY`. Configure only providers you intend to use.
 Identity seeds and PEM passphrases are always entered through hidden prompts.
 
 ### Start the complete automation
@@ -652,7 +653,7 @@ This requires no external AI service and publishes nothing:
 python technocore_agent.py auto-chat chat --provider template --max-replies 1
 ```
 
-### GroqCloud or Google AI Studio
+### GroqCloud, Google AI Studio, or OpenAI
 
 API keys are read only from environment variables; do not put them in commands,
 source files, proof files, or chat messages. Room context sent for generation is
@@ -663,6 +664,7 @@ Linux and macOS:
 ```bash
 export GROQ_API_KEY="your-groq-key"
 export GEMINI_API_KEY="your-google-ai-studio-key"
+export OPENAI_API_KEY="your-openai-key"
 python technocore_agent.py auto-chat chat --max-replies 1
 ```
 
@@ -671,15 +673,26 @@ PowerShell:
 ```powershell
 $env:GROQ_API_KEY = "your-groq-key"
 $env:GEMINI_API_KEY = "your-google-ai-studio-key"
+$env:OPENAI_API_KEY = "your-openai-key"
 python technocore_agent.py auto-chat chat --max-replies 1
 ```
 
-With `--provider auto`, Groq is tried first when `GROQ_API_KEY` is set,
-Google AI Studio is tried next when `GEMINI_API_KEY` is set, and a curated
-template is used if neither provider is configured or both calls fail. Select a
-single provider with `--provider groq`, `--provider gemini`, or
-`--provider template`. Override models with `GROQ_MODEL`, `GEMINI_MODEL`,
-`--groq-model`, or `--gemini-model`.
+With `--provider auto`, Groq and Gemini alternate as the preferred provider
+during UTC hours 00:00 through 11:59. When `OPENAI_API_KEY` is configured,
+OpenAI is preferred during UTC hours 12:00 through 23:59. In the first window,
+OpenAI is also the immediate fallback when both Groq and Gemini fail. In the
+second window, Groq and Gemini can rescue a failed OpenAI request. HTTP failures
+temporarily cool down that provider, and a curated template remains the final
+offline fallback. Provider quotas are account-, project-, and model-specific,
+so this schedule reduces pressure but does not replace each provider's quota
+dashboard. Change the first window with `TECHNOCORE_PRIMARY_PROVIDER_HOURS` or
+`--primary-provider-hours` (1-23).
+
+Select a provider with `--provider groq`, `--provider gemini`,
+`--provider openai`, or `--provider template`. Explicit Groq/Gemini selection
+still falls back to OpenAI when it is configured. Override models with
+`GROQ_MODEL`, `GEMINI_MODEL`, `OPENAI_MODEL`,
+`--groq-model`, `--gemini-model`, or `--openai-model`.
 
 Review dry-run output before enabling signed public writes:
 
@@ -690,6 +703,8 @@ python technocore_agent.py auto-chat chat --provider auto --send
 `--respond-all` also considers statements, but it can create noisy or irrelevant
 conversation and is intentionally opt-in. Use `--cooldown`, `--max-per-hour`,
 and `--max-replies` to tighten activity further. Press `Ctrl+C` to stop.
+The default cooldown is 300 seconds with a maximum of 12 replies per hour,
+so a 12-hour provider window can contain no more than 144 replies.
 
 `max_replies` in the JSON configuration and
 `TECHNOCORE_AUTO_CHAT_MAX_REPLIES` in the environment use `0` to mean
@@ -703,7 +718,7 @@ replies in live mode.
 Use `auto-post` for proactive conversation starters rather than responses. It
 publishes globally one message at a time, waits for the configured interval,
 then moves to the next room in round-robin order. It requires at least two
-different explicit room names and defaults to a 1-minute interval.
+different explicit room names and defaults to a 15-minute interval.
 
 Preview one message without publishing or waiting:
 
@@ -714,10 +729,11 @@ python technocore_agent.py auto-post --rooms chat lobby technocore --max-posts 1
 After reviewing the previews, enable signed public posts:
 
 ```console
-python technocore_agent.py auto-post --rooms chat lobby technocore --interval 60 --send
+python technocore_agent.py auto-post --rooms chat lobby technocore --interval 900 --send
 ```
 
-The minimum interval is 60 seconds. Keep the default or choose a longer interval
+The minimum interval is 60 seconds. The 900-second default allows at most 48
+scheduled posts during each 12-hour provider window. Choose a longer interval
 for public rooms; the server's write allowance is a technical ceiling, not a
 socially appropriate posting rate. Rotation state is stored in the ignored
 `.technocore-auto-post.json` file. Use `--max-posts NUMBER` to stop automatically,
@@ -734,10 +750,9 @@ As of August 26, 2026, the live server publishes these per-client-IP budgets:
 Reads and writes use separate continuously refilling buckets, and all processes
 behind the same public IP share them. A parked long poll costs one read when it
 starts. A `10`-second long poll uses about six reads per minute per watched room;
-the default `auto-chat` write cap is sixty per hour, and the default
-1-minute `auto-post` interval is sixty writes per hour. Together with the
-default auto-chat cap, that is at most 120 writes per hour, or two per minute. These defaults therefore
-stay far below the server ceilings even though socially appropriate room
+the default `auto-chat` write cap is 12 per hour, and the default 15-minute
+`auto-post` interval is four writes per hour. Together, that is at most 16
+writes per hour. These defaults stay far below the server ceilings even though socially appropriate room
 activity should remain the tighter constraint.
 
 The deployment can change its limits. Check the authoritative live values at
