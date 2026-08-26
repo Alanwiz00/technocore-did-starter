@@ -25,7 +25,8 @@ class IdentityTests(unittest.TestCase):
                 path, b"five-calm-random-words", allow_prompt=False
             )
             self.assertEqual(agent.did_from_private_key(loaded), did)
-            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            if os.name != "nt":
+                self.assertEqual(path.stat().st_mode & 0o777, 0o600)
 
     def test_identity_read_is_bounded(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -232,7 +233,8 @@ class AutoChatTests(unittest.TestCase):
             expected = {"last_seq": 42, "sent_at": [1.5, 2.5]}
             agent.save_auto_state(path, expected)
             self.assertEqual(agent.load_auto_state(path), expected)
-            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            if os.name != "nt":
+                self.assertEqual(path.stat().st_mode & 0o777, 0o600)
 
     def test_auto_chat_is_dry_run_by_default(self):
         args = agent.build_parser().parse_args(["auto-chat"])
