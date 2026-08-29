@@ -1,13 +1,15 @@
+import errno
 import json
 import io
 import os
+import socket
 import tempfile
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 from urllib.request import Request
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
@@ -196,10 +198,291 @@ class NetworkTests(unittest.TestCase):
         retryable = agent.RetryableNetworkError("temporary failure", 2)
         with patch.object(
             agent, "read_room", side_effect=[retryable, response]
-        ), patch.object(agent.time, "sleep") as sleep, patch("sys.stderr", new=io.StringIO()):
+        ), patch.object(agent.time, "sleep") as sleep, patch.object(
+            agent.random, "uniform", return_value=1.0
+        ), patch("sys.stderr", new=io.StringIO()):
             followed = agent.follow_room("chat", since=10, wait=1, timeout=2)
             self.assertEqual(next(followed), response)
-        sleep.assert_called_once_with(2)
+        sleep.assert_called_once_with(agent.FOLLOW_RETRY_BASE_SECONDS)
+
+    def test_follow_room_backoff_grows_and_is_capped(self):
+        response = {
+            "room": "chat",
+            "count": 1,
+            "last_seq": 11,
+            "messages": [{"seq": 11, "from": "human", "text": "back", "nonce": None}],
+        }
+        retryable = agent.RetryableNetworkError("origin blip", 1)
+        with patch.object(
+            agent, "read_room", side_effect=[retryable] * 6 + [response]
+        ), patch.object(agent.time, "sleep") as sleep, patch.object(
+            agent.random, "uniform", return_value=1.0
+        ), patch("sys.stderr", new=io.StringIO()):
+            followed = agent.follow_room("chat", since=10, wait=1, timeout=2)
+            self.assertEqual(next(followed), response)
+        waited = [call.args[0] for call in sleep.call_args_list]
+        self.assertEqual(waited, [5.0, 10.0, 20.0, 40.0, 60.0, 60.0])
+        self.assertTrue(all(value <= agent.FOLLOW_RETRY_CAP_SECONDS for value in waited))
+
+    def test_follow_room_drops_long_poll_after_repeated_failures(self):
+        response = {
+            "room": "chat",
+            "count": 1,
+            "last_seq": 11,
+            "messages": [{"seq": 11, "from": "human", "text": "back", "nonce": None}],
+        }
+        retryable = agent.RetryableNetworkError("origin blip", 1)
+        calls = []
+
+        def record(room, **kwargs):
+            calls.append(kwargs)
+            if len(calls) <= agent.FOLLOW_PLAIN_POLL_AFTER:
+                raise retryable
+            return response
+
+        with patch.object(
+            agent, "read_room", side_effect=record
+        ), patch.object(agent.time, "sleep"), patch.object(
+            agent.random, "uniform", return_value=1.0
+        ), patch("sys.stderr", new=io.StringIO()):
+            followed = agent.follow_room("chat", since=10, wait=5, timeout=20)
+            self.assertEqual(next(followed), response)
+
+        self.assertEqual(calls[0]["wait"], 5.0)
+        self.assertEqual(calls[0]["cache_buster"], 0)
+        degraded = calls[agent.FOLLOW_PLAIN_POLL_AFTER]
+        self.assertIsNone(degraded["wait"])
+        self.assertIsNone(degraded["cache_buster"])
+
+    def test_read_room_resilient_rides_out_a_startup_blip(self):
+        ok = {"room": "chat", "count": 0, "last_seq": 3, "messages": []}
+        blip = agent.RetryableNetworkError("origin blip", 1)
+        with patch.object(
+            agent, "read_room", side_effect=[blip, blip, ok]
+        ), patch.object(agent.time, "sleep") as sleep, patch.object(
+            agent.random, "uniform", return_value=1.0
+        ), patch("sys.stderr", new=io.StringIO()):
+            self.assertEqual(agent.read_room_resilient("chat"), ok)
+        self.assertEqual([c.args[0] for c in sleep.call_args_list], [5.0, 10.0])
+
+    def test_read_room_resilient_gives_up_after_its_attempt_budget(self):
+        blip = agent.RetryableNetworkError("origin blip", 1)
+        with patch.object(
+            agent, "read_room", side_effect=blip
+        ) as read, patch.object(agent.time, "sleep"), patch.object(
+            agent.random, "uniform", return_value=1.0
+        ), patch("sys.stderr", new=io.StringIO()):
+            with self.assertRaises(agent.RetryableNetworkError):
+                agent.read_room_resilient("chat", attempts=3)
+        self.assertEqual(read.call_count, 3)
+
+    def test_transport_error_is_retryable_split_by_direction(self):
+        no_route = OSError(errno.ENETUNREACH, "Network is unreachable")
+        self.assertTrue(agent.transport_error_is_retryable(no_route, is_write=True))
+        self.assertTrue(agent.transport_error_is_retryable(no_route, is_write=False))
+        dns = socket.gaierror(socket.EAI_NONAME, "Name or service not known")
+        self.assertTrue(agent.transport_error_is_retryable(dns, is_write=True))
+        reset = OSError(errno.ECONNRESET, "Connection reset by peer")
+        self.assertFalse(agent.transport_error_is_retryable(reset, is_write=True))
+        self.assertTrue(agent.transport_error_is_retryable(reset, is_write=False))
+        opaque = OSError(errno.EACCES, "permission denied")
+        self.assertFalse(agent.transport_error_is_retryable(opaque, is_write=True))
+        self.assertFalse(agent.transport_error_is_retryable("tls handshake", is_write=False))
+
+    def test_unreachable_network_is_retryable_even_for_a_write(self):
+        error = URLError(OSError(errno.ENETUNREACH, "Network is unreachable"))
+        with patch.object(agent.HTTP_OPENER, "open", side_effect=error):
+            with self.assertRaises(agent.RetryableNetworkError):
+                agent.request_json(
+                    Request("https://technocore.chat/r/chat"), 1, is_write=True
+                )
+
+    def test_unknown_transport_failure_stays_fatal_for_a_write(self):
+        error = URLError("unverified TLS certificate")
+        with patch.object(agent.HTTP_OPENER, "open", side_effect=error):
+            with self.assertRaises(agent.NetworkError) as raised:
+                agent.request_json(
+                    Request("https://technocore.chat/r/chat"), 1, is_write=True
+                )
+        self.assertNotIsInstance(raised.exception, agent.RetryableNetworkError)
+
+    def test_post_resends_with_the_same_nonce_after_a_pre_send_failure(self):
+        key = Ed25519PrivateKey.generate()
+        sent = []
+
+        def fake_request_json(request, timeout, *, is_write=False):
+            payload = json.loads(request.data.decode("utf-8"))
+            sent.append(payload)
+            if len(sent) == 1:
+                raise agent.RetryableNetworkError("could not reach Technocore", 5.0)
+            return {
+                "room": "chat",
+                "count": 1,
+                "last_seq": 4,
+                "messages": [
+                    {
+                        "seq": 4,
+                        "from": payload["did"],
+                        "text": payload["text"],
+                        "nonce": payload["nonce"],
+                    }
+                ],
+                "posted": {
+                    "seq": 4,
+                    "from": payload["did"],
+                    "text": payload["text"],
+                    "nonce": payload["nonce"],
+                },
+            }
+
+        with patch.object(
+            agent, "request_json", side_effect=fake_request_json
+        ), patch.object(agent.time, "sleep"), patch.object(
+            agent.random, "uniform", return_value=1.0
+        ), patch("sys.stderr", new=io.StringIO()):
+            response = agent.post_signed_message(key, "chat", "hello world", nonce=7)
+
+        self.assertEqual(len(sent), 2)
+        self.assertEqual(sent[0]["nonce"], sent[1]["nonce"])
+        self.assertEqual(sent[0]["nonce"], "7")
+        self.assertEqual(response["posted"]["seq"], 4)
+
+    def test_post_stops_after_the_transport_retry_budget(self):
+        key = Ed25519PrivateKey.generate()
+        calls = []
+
+        def always_unreachable(request, timeout, *, is_write=False):
+            calls.append(1)
+            raise agent.RetryableNetworkError("could not reach Technocore", 5.0)
+
+        with patch.object(
+            agent, "request_json", side_effect=always_unreachable
+        ), patch.object(agent.time, "sleep"), patch.object(
+            agent.random, "uniform", return_value=1.0
+        ), patch("sys.stderr", new=io.StringIO()):
+            with self.assertRaises(agent.RetryableNetworkError):
+                agent.post_signed_message(
+                    key, "chat", "hello world", nonce=7, transport_retries=2
+                )
+        self.assertEqual(len(calls), 3)
+
+    def test_stale_nonce_write_is_classified_for_retry(self):
+        body = (
+            "400 nonce 1787897806837922159 is not greater than "
+            "1787897807376081293, the last one this key used in /r/technocore "
+            "— a signed URL is single-use, so count up"
+        )
+        error = HTTPError(
+            "https://technocore.chat/r/technocore",
+            400,
+            "Bad Request",
+            {},
+            io.BytesIO(json.dumps({"detail": body}).encode()),
+        )
+        with patch.object(agent.HTTP_OPENER, "open", side_effect=error):
+            with self.assertRaises(agent.NonceRejectedError) as raised:
+                agent.request_json(
+                    Request("https://technocore.chat/r/technocore"), 1, is_write=True
+                )
+        self.assertEqual(raised.exception.last_nonce, 1787897807376081293)
+
+    def test_other_write_400_is_not_a_nonce_error(self):
+        error = HTTPError(
+            "https://technocore.chat/r/chat",
+            400,
+            "Bad Request",
+            {},
+            io.BytesIO(b'{"detail":"room name is invalid"}'),
+        )
+        with patch.object(agent.HTTP_OPENER, "open", side_effect=error):
+            with self.assertRaises(agent.NetworkError) as raised:
+                agent.request_json(
+                    Request("https://technocore.chat/r/chat"), 1, is_write=True
+                )
+        self.assertNotIsInstance(raised.exception, agent.NonceRejectedError)
+
+    def test_read_400_never_looks_for_a_nonce(self):
+        error = HTTPError(
+            "https://technocore.chat/r/chat",
+            400,
+            "Bad Request",
+            {},
+            io.BytesIO(b"nonce 1 is not greater than 9, count up"),
+        )
+        with patch.object(agent.HTTP_OPENER, "open", side_effect=error):
+            with self.assertRaises(agent.NetworkError) as raised:
+                agent.request_json(Request("https://technocore.chat/r/chat"), 1)
+        self.assertNotIsInstance(raised.exception, agent.NonceRejectedError)
+
+    def test_nonce_after_counts_past_the_servers_value(self):
+        self.assertGreater(int(agent.nonce_after(10**18)), 10**18)
+        self.assertRegex(agent.nonce_after(10**18), r"\A[0-9]{1,19}\Z")
+        with self.assertRaises(agent.ProtocolError):
+            agent.nonce_after(agent.MAX_NONCE)
+
+    def test_parse_rejected_nonce_reads_the_servers_value(self):
+        self.assertEqual(
+            agent.parse_rejected_nonce(b"nonce 5 is not greater than 42, count up"),
+            42,
+        )
+        self.assertIsNone(agent.parse_rejected_nonce(b"unrelated bad request"))
+
+    def test_post_retries_with_a_higher_nonce_after_a_stale_nonce(self):
+        key = Ed25519PrivateKey.generate()
+        sent = []
+
+        def fake_request_json(request, timeout, *, is_write=False):
+            payload = json.loads(request.data.decode("utf-8"))
+            sent.append(payload)
+            if len(sent) == 1:
+                raise agent.NonceRejectedError("stale nonce", 10**18)
+            return {
+                "room": "chat",
+                "count": 1,
+                "last_seq": 7,
+                "messages": [
+                    {
+                        "seq": 7,
+                        "from": payload["did"],
+                        "text": payload["text"],
+                        "nonce": payload["nonce"],
+                    }
+                ],
+                "posted": {
+                    "seq": 7,
+                    "from": payload["did"],
+                    "text": payload["text"],
+                    "nonce": payload["nonce"],
+                },
+            }
+
+        with patch.object(
+            agent, "request_json", side_effect=fake_request_json
+        ), patch("sys.stderr", new=io.StringIO()):
+            response = agent.post_signed_message(key, "chat", "hello world", nonce=1)
+
+        self.assertEqual(len(sent), 2)
+        self.assertEqual(int(sent[0]["nonce"]), 1)
+        self.assertGreater(int(sent[1]["nonce"]), 10**18)
+        self.assertEqual(response["posted"]["seq"], 7)
+
+    def test_post_stops_after_the_nonce_retry_budget(self):
+        key = Ed25519PrivateKey.generate()
+        attempts = []
+
+        def always_stale(request, timeout, *, is_write=False):
+            attempts.append(json.loads(request.data.decode("utf-8"))["nonce"])
+            raise agent.NonceRejectedError("stale nonce", 10**18 + len(attempts))
+
+        with patch.object(
+            agent, "request_json", side_effect=always_stale
+        ), patch("sys.stderr", new=io.StringIO()):
+            with self.assertRaises(agent.NonceRejectedError):
+                agent.post_signed_message(
+                    key, "chat", "hello world", nonce=1, nonce_retries=2
+                )
+
+        self.assertEqual(len(attempts), 3)
 
     def test_proof_file_size_limit(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -397,6 +680,54 @@ class AutoChatTests(unittest.TestCase):
                 post.assert_not_called()
             self.assertEqual(agent.load_auto_state(args.state)["last_seq"], 11)
 
+    def test_failed_reply_write_is_unconfirmed_without_stopping_auto_chat(self):
+        key = Ed25519PrivateKey.generate()
+        incoming = {
+            "room": "chat",
+            "count": 1,
+            "last_seq": 11,
+            "messages": [
+                {"seq": 11, "from": "human", "text": "What should we test?"}
+            ],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            args = SimpleNamespace(
+                cooldown=300.0,
+                max_per_hour=12,
+                max_replies=0,
+                state=Path(directory) / "state.json",
+                since=10,
+                room="chat",
+                context=10,
+                base_url=agent.DEFAULT_BASE_URL,
+                timeout=1.0,
+                wait=1.0,
+                respond_all=False,
+                provider="template",
+                groq_model=agent.DEFAULT_GROQ_MODEL,
+                gemini_model=agent.DEFAULT_GEMINI_MODEL,
+                generation_timeout=1.0,
+                send=True,
+            )
+            output = io.StringIO()
+            errors = io.StringIO()
+            with patch.object(
+                agent, "follow_room", return_value=iter([incoming])
+            ), patch.object(
+                agent, "post_signed_message",
+                side_effect=agent.NetworkError("Technocore returned HTTP 503"),
+            ), redirect_stdout(output), patch("sys.stderr", new=errors):
+                self.assertEqual(agent.run_auto_chat(key, args), 0)
+
+            result = json.loads(output.getvalue())
+            self.assertEqual(result["status"], "unconfirmed")
+            self.assertEqual(result["reply_to"], 11)
+            self.assertRegex(result["nonce"], r"\A[0-9]{1,19}\Z")
+            self.assertIn("continuing to watch", errors.getvalue())
+            state = agent.load_auto_state(args.state)
+            self.assertEqual(state["last_seq"], 11)
+            self.assertEqual(len(state["sent_at"]), 1)
+
 
 class AutoPostTests(unittest.TestCase):
     def test_dry_run_previews_one_message_and_rotates_room(self):
@@ -449,6 +780,35 @@ class AutoPostTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(agent.ProtocolError, "at least 60"):
             agent.run_auto_post(key, args)
+
+    def test_auto_post_retries_the_room_after_a_failed_send(self):
+        key = Ed25519PrivateKey.generate()
+        with tempfile.TemporaryDirectory() as directory:
+            args = SimpleNamespace(
+                interval=60.0,
+                max_posts=1,
+                rooms=["chat", "lobby"],
+                state=Path(directory) / "post-state.json",
+                send=True,
+                base_url=agent.DEFAULT_BASE_URL,
+                timeout=1.0,
+            )
+            outcomes = [
+                agent.NetworkError("could not reach Technocore: [Errno 101]"),
+                {"posted": {"seq": 5, "nonce": "123"}},
+            ]
+            with patch.object(
+                agent, "post_signed_message", side_effect=outcomes
+            ) as post, patch.object(agent.time, "sleep"), redirect_stdout(
+                io.StringIO()
+            ), patch("sys.stderr", new=io.StringIO()) as errors:
+                self.assertEqual(agent.run_auto_post(key, args), 0)
+            self.assertEqual(post.call_count, 2)
+            self.assertEqual(
+                [call.args[1] for call in post.call_args_list], ["chat", "chat"]
+            )
+            self.assertIn("auto-post to chat failed", errors.getvalue())
+            self.assertEqual(agent.load_auto_post_state(args.state)["room_index"], 1)
 
 
 class ConfigurationTests(unittest.TestCase):

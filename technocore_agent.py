@@ -5,12 +5,14 @@ from __future__ import annotations
 
 import argparse
 import base64
+import errno
 import getpass
 import json
 import math
 import os
 import random
 import re
+import socket
 import stat
 import sys
 import time
@@ -30,7 +32,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import (
     Ed25519PublicKey,
 )
 
-APP_VERSION = "1.6.0"
+APP_VERSION = "1.6.1"
 DEFAULT_BASE_URL = "https://technocore.chat"
 DEFAULT_KEY_PATH = Path("identity.pem")
 DEFAULT_TIMEOUT_SECONDS = 20.0
@@ -47,6 +49,33 @@ DEFAULT_PRIMARY_PROVIDER_HOURS = 12
 DEFAULT_PROVIDER_COOLDOWN_SECONDS = 60.0
 DEFAULT_CONFIG_PATH = Path("technocore.config.json")
 MIN_FOLLOW_INTERVAL_SECONDS = 0.5
+FOLLOW_RETRY_BASE_SECONDS = 5.0
+FOLLOW_RETRY_CAP_SECONDS = 60.0
+FOLLOW_PLAIN_POLL_AFTER = 3
+FOLLOW_ALERT_EVERY = 10
+DEFAULT_TRANSPORT_RETRY_SECONDS = 5.0
+# Transport failures that prove the request never reached Technocore, so even a
+# write may be retried: no route, host down, connection refused, DNS failure.
+PRE_SEND_TRANSPORT_ERRNOS = frozenset(
+    code
+    for code in (
+        getattr(errno, name, None)
+        for name in (
+            "ENETUNREACH", "EHOSTUNREACH", "ENETDOWN", "ECONNREFUSED",
+            "EHOSTDOWN", "EADDRNOTAVAIL", "EAFNOSUPPORT",
+        )
+    )
+    if code is not None
+)
+# Transport failures where a write's outcome is unknowable but a read may retry.
+AMBIGUOUS_TRANSPORT_ERRNOS = frozenset(
+    code
+    for code in (
+        getattr(errno, name, None)
+        for name in ("ECONNRESET", "ECONNABORTED", "ENETRESET", "EPIPE", "ETIMEDOUT")
+    )
+    if code is not None
+)
 MAX_MESSAGE_CHARS = 4096
 MAX_RESPONSE_BYTES = 5 * 1024 * 1024
 MAX_ERROR_RESPONSE_BYTES = 16 * 1024
@@ -64,6 +93,8 @@ BASE58BTC_INDEX = {
 INVISIBLE_CATEGORIES = frozenset({"Cc", "Cf", "Cs", "Co", "Zl", "Zp"})
 NAME_PATTERN = re.compile(r"[a-z0-9][a-z0-9_-]{0,47}")
 NONCE_PATTERN = re.compile(r"[0-9]{1,19}")
+MAX_NONCE = 10**19 - 1
+NONCE_REJECTION_PATTERN = re.compile(r"not greater than\s+([0-9]{1,19})")
 SIGNATURE_PATTERN = re.compile(rf"[A-Za-z0-9_-]{{{SIGNATURE_LENGTH}}}")
 COMMIT_PATTERN = re.compile(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})")
 ED25519_SEED_PATTERN = re.compile(r"[0-9a-fA-F]{64}")
@@ -125,6 +156,14 @@ class RetryableNetworkError(NetworkError):
         self.retry_after = retry_after
 
 
+class NonceRejectedError(NetworkError):
+    """A signed write was refused because its nonce was not strictly increasing."""
+
+    def __init__(self, message: str, last_nonce: int) -> None:
+        super().__init__(message)
+        self.last_nonce = last_nonce
+
+
 class ProviderNetworkError(NetworkError):
     """A generation provider failed and should be cooled down temporarily."""
 
@@ -147,6 +186,23 @@ class NoRedirectHandler(HTTPRedirectHandler):
 
 
 HTTP_OPENER = build_opener(NoRedirectHandler)
+
+
+def transport_error_is_retryable(reason: Any, *, is_write: bool) -> bool:
+    """Whether a connect/DNS failure can be safely followed by another attempt.
+
+    A read is idempotent, so any transport failure may be retried. A write may
+    only be retried when the failure proves the request never left this host —
+    otherwise its outcome is unknown and a blind resend could double-post.
+    """
+    if isinstance(reason, socket.gaierror):
+        return True
+    reason_errno = getattr(reason, "errno", None)
+    if reason_errno in PRE_SEND_TRANSPORT_ERRNOS:
+        return True
+    if not is_write and reason_errno in AMBIGUOUS_TRANSPORT_ERRNOS:
+        return True
+    return False
 
 
 def base58btc_encode(data: bytes) -> str:
@@ -250,6 +306,24 @@ def validate_nonce(value: str | int) -> str:
 def next_nonce() -> str:
     """Create a high-resolution wall-clock nonce within the 19-digit limit."""
     return validate_nonce(time.time_ns())
+
+
+def parse_rejected_nonce(raw_error: bytes) -> int | None:
+    """Return the server's last-used nonce from a rejected signed write, if named."""
+    if not isinstance(raw_error, (bytes, bytearray)):
+        return None
+    match = NONCE_REJECTION_PATTERN.search(raw_error.decode("utf-8", errors="replace"))
+    return int(match.group(1)) if match is not None else None
+
+
+def nonce_after(last_nonce: int) -> str:
+    """Return the smallest valid nonce strictly greater than the server's last."""
+    if isinstance(last_nonce, bool) or not isinstance(last_nonce, int) or last_nonce < 0:
+        raise ProtocolError("the rejected-nonce report was not a whole number")
+    candidate = max(last_nonce + 1, time.time_ns())
+    if candidate > MAX_NONCE:
+        raise ProtocolError("cannot advance the nonce past the 19-digit protocol limit")
+    return validate_nonce(candidate)
 
 
 def sign_bytes(private_key: Ed25519PrivateKey, payload: bytes) -> str:
@@ -555,6 +629,12 @@ def request_json(
             raise NetworkError(
                 f"Technocore returned redirect HTTP {error.code}; redirects are refused"
             ) from None
+        if is_write and error.code == 400:
+            rejected = parse_rejected_nonce(raw_error)
+            if rejected is not None:
+                raise NonceRejectedError(
+                    f"Technocore rejected a stale nonce: {detail}", rejected
+                ) from None
         if not is_write and (error.code == 429 or 500 <= error.code <= 599):
             retry_after = 5.0
             try:
@@ -575,17 +655,32 @@ def request_json(
             ) from None
         raise NetworkError(f"Technocore returned HTTP {error.code}: {detail}") from None
     except URLError as error:
-        if isinstance(error.reason, TimeoutError):
-            raise NetworkError(timeout_detail) from error
-        raise NetworkError(
-            f"could not reach Technocore: {terminal_safe_detail(error.reason)}"
-        ) from error
+        reason = error.reason
+        if isinstance(reason, TimeoutError):
+            if is_write:
+                raise NetworkError(timeout_detail) from error
+            raise RetryableNetworkError(
+                timeout_detail, DEFAULT_TRANSPORT_RETRY_SECONDS
+            ) from error
+        message = f"could not reach Technocore: {terminal_safe_detail(reason)}"
+        if transport_error_is_retryable(reason, is_write=is_write):
+            raise RetryableNetworkError(
+                message, DEFAULT_TRANSPORT_RETRY_SECONDS
+            ) from error
+        raise NetworkError(message) from error
     except TimeoutError as error:
-        raise NetworkError(timeout_detail) from error
-    except OSError as error:
-        raise NetworkError(
-            f"Technocore request failed: {terminal_safe_detail(error)}"
+        if is_write:
+            raise NetworkError(timeout_detail) from error
+        raise RetryableNetworkError(
+            timeout_detail, DEFAULT_TRANSPORT_RETRY_SECONDS
         ) from error
+    except OSError as error:
+        message = f"Technocore request failed: {terminal_safe_detail(error)}"
+        if transport_error_is_retryable(error, is_write=is_write):
+            raise RetryableNetworkError(
+                message, DEFAULT_TRANSPORT_RETRY_SECONDS
+            ) from error
+        raise NetworkError(message) from error
     if len(raw_body) > MAX_RESPONSE_BYTES:
         raise NetworkError(
             f"Technocore response exceeded the {MAX_RESPONSE_BYTES}-byte safety limit"
@@ -654,33 +749,80 @@ def post_signed_message(
     nonce: str | int | None = None,
     base_url: str = DEFAULT_BASE_URL,
     timeout: float = DEFAULT_TIMEOUT_SECONDS,
+    nonce_retries: int = 3,
+    transport_retries: int = 4,
 ) -> dict[str, Any]:
-    """Normalize, sign, and POST one message without automatic retries."""
-    selected_nonce = validate_nonce(nonce if nonce is not None else next_nonce())
-    normalized, payload = message_payload(room, selected_nonce, text)
+    """Normalize, sign, and POST one message.
+
+    A signed write carries a single-use nonce that must be strictly greater than
+    the last one the key used; a wall-clock nonce can violate that after the
+    system clock steps backwards. When Technocore reports the rejection it also
+    names its last-used nonce, so retry up to ``nonce_retries`` times, each time
+    counting up past the value the server reported.
+
+    A transport failure that proves the request never left this host (no route,
+    DNS failure, connection refused) is retried with the same nonce up to
+    ``transport_retries`` times, with the shared jittered backoff.
+    """
+    for name, value in (
+        ("nonce_retries", nonce_retries),
+        ("transport_retries", transport_retries),
+    ):
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ProtocolError(f"{name} must be zero or a positive integer")
     did = did_from_private_key(private_key)
-    request_body = json.dumps(
-        {
-            "did": did,
-            "sig": sign_bytes(private_key, payload),
-            "nonce": selected_nonce,
-            "text": normalized,
-        },
-        ensure_ascii=False,
-        separators=(",", ":"),
-    ).encode("utf-8")
     valid_base_url = validate_base_url(base_url)
-    request = Request(
-        f"{valid_base_url}/r/{validate_name(room)}?format=json",
-        data=request_body,
-        method="POST",
-        headers={
-            "Accept": "application/json",
-            "Content-Type": "application/json; charset=utf-8",
-            "User-Agent": f"technocore-did-starter/{APP_VERSION}",
-        },
-    )
-    response = request_json(request, timeout, is_write=True)
+    selected_nonce = validate_nonce(nonce if nonce is not None else next_nonce())
+    attempts = 0
+    transport_attempts = 0
+    while True:
+        normalized, payload = message_payload(room, selected_nonce, text)
+        request_body = json.dumps(
+            {
+                "did": did,
+                "sig": sign_bytes(private_key, payload),
+                "nonce": selected_nonce,
+                "text": normalized,
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        request = Request(
+            f"{valid_base_url}/r/{validate_name(room)}?format=json",
+            data=request_body,
+            method="POST",
+            headers={
+                "Accept": "application/json",
+                "Content-Type": "application/json; charset=utf-8",
+                "User-Agent": f"technocore-did-starter/{APP_VERSION}",
+            },
+        )
+        try:
+            response = request_json(request, timeout, is_write=True)
+            break
+        except NonceRejectedError as error:
+            if attempts >= nonce_retries:
+                raise
+            attempts += 1
+            selected_nonce = nonce_after(error.last_nonce)
+            print(
+                f"warning: {error}; retrying with nonce {selected_nonce} "
+                f"(attempt {attempts} of {nonce_retries})",
+                file=sys.stderr,
+                flush=True,
+            )
+        except RetryableNetworkError as error:
+            if transport_attempts >= transport_retries:
+                raise
+            transport_attempts += 1
+            delay = follow_backoff_delay(transport_attempts, error.retry_after)
+            print(
+                f"warning: {error}; resending in {delay:.0f}s "
+                f"(attempt {transport_attempts} of {transport_retries})",
+                file=sys.stderr,
+                flush=True,
+            )
+            time.sleep(delay)
     validate_room_response(response, room)
     posted = response.get("posted")
     if not isinstance(posted, dict):
@@ -780,30 +922,66 @@ def follow_room(
     base_url: str = DEFAULT_BASE_URL,
     timeout: float = DEFAULT_TIMEOUT_SECONDS,
 ) -> Iterator[dict[str, Any]]:
-    """Continuously yield non-empty room responses while advancing the cursor."""
+    """Continuously yield non-empty room responses while advancing the cursor.
+
+    Retryable read failures (429 and 5xx) never end the stream. The wait between
+    attempts grows exponentially from ``FOLLOW_RETRY_BASE_SECONDS`` toward
+    ``FOLLOW_RETRY_CAP_SECONDS`` with +/-20% jitter, and after
+    ``FOLLOW_PLAIN_POLL_AFTER`` consecutive failures the loop drops ``wait=`` and
+    the cache-buster so an edge-cached plain read can carry it through a brief
+    origin outage. Any success resets both the backoff and the fallback.
+    """
     selected_wait = validate_follow_wait(wait)
     cursor = since
     cache_buster = 0
+    failures = 0
+    downtime = 0.0
     while True:
+        degraded = failures >= FOLLOW_PLAIN_POLL_AFTER
         request_started = time.monotonic()
         try:
             response = read_room(
                 room,
                 since=cursor,
                 limit=limit,
-                wait=selected_wait,
-                cache_buster=cache_buster,
+                wait=None if degraded else selected_wait,
+                cache_buster=None if degraded else cache_buster,
                 base_url=base_url,
                 timeout=timeout,
             )
         except RetryableNetworkError as error:
+            failures += 1
+            delay = follow_backoff_delay(failures, error.retry_after)
+            downtime += delay
+            if failures % FOLLOW_ALERT_EVERY == 0:
+                print(
+                    f"error: Technocore reads still failing after {failures} "
+                    f"attempts (~{downtime / 60:.0f} min); continuing to retry",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            else:
+                fallback = (
+                    "; polling without wait="
+                    if failures >= FOLLOW_PLAIN_POLL_AFTER
+                    else ""
+                )
+                print(
+                    f"warning: {error}; retry {failures} in {delay:.0f}s{fallback}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            time.sleep(delay)
+            continue
+        if failures:
             print(
-                f"warning: {error}; retrying read in {error.retry_after:g} seconds",
+                f"info: Technocore reads recovered after {failures} failed "
+                f"attempt(s)",
                 file=sys.stderr,
                 flush=True,
             )
-            time.sleep(error.retry_after)
-            continue
+            failures = 0
+            downtime = 0.0
         cache_buster += 1
         if response["messages"]:
             next_cursor = response["last_seq"]
@@ -816,6 +994,40 @@ def follow_room(
         elapsed = time.monotonic() - request_started
         if elapsed < MIN_FOLLOW_INTERVAL_SECONDS:
             time.sleep(MIN_FOLLOW_INTERVAL_SECONDS - elapsed)
+
+
+def follow_backoff_delay(attempt: int, floor: float = 0.0) -> float:
+    """Jittered exponential backoff for read retries, shared by the follow paths."""
+    delay = min(
+        FOLLOW_RETRY_CAP_SECONDS,
+        FOLLOW_RETRY_BASE_SECONDS * 2 ** min(max(attempt - 1, 0), 20) * random.uniform(0.8, 1.2),
+    )
+    return max(delay, floor)
+
+
+def read_room_resilient(
+    room: str,
+    *,
+    limit: int = 50,
+    base_url: str = DEFAULT_BASE_URL,
+    timeout: float = DEFAULT_TIMEOUT_SECONDS,
+    attempts: int = 5,
+) -> dict[str, Any]:
+    """One-shot snapshot read that rides out a brief retryable outage at startup."""
+    for attempt in range(1, attempts + 1):
+        try:
+            return read_room(room, limit=limit, base_url=base_url, timeout=timeout)
+        except RetryableNetworkError as error:
+            if attempt >= attempts:
+                raise
+            delay = follow_backoff_delay(attempt, error.retry_after)
+            print(
+                f"warning: {error}; initial read retry {attempt} in {delay:.0f}s",
+                file=sys.stderr,
+                flush=True,
+            )
+            time.sleep(delay)
+    raise AssertionError("unreachable")
 
 
 def request_external_json(
@@ -1188,13 +1400,24 @@ def run_auto_post(private_key: Ed25519PrivateKey, args: argparse.Namespace) -> i
             flush=True,
         )
         if args.send:
-            response = post_signed_message(
-                private_key,
-                room,
-                text,
-                base_url=args.base_url,
-                timeout=args.timeout,
-            )
+            try:
+                response = post_signed_message(
+                    private_key,
+                    room,
+                    text,
+                    base_url=args.base_url,
+                    timeout=args.timeout,
+                )
+            except NetworkError as error:
+                retry_in = min(args.interval, FOLLOW_RETRY_CAP_SECONDS)
+                print(
+                    f"error: auto-post to {room} failed: {error}; "
+                    f"retrying in {retry_in:g}s",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                time.sleep(retry_in)
+                continue
             posted = response["posted"]
             print(
                 f"posted room={room} seq={posted['seq']} nonce={posted['nonce']}",
@@ -1233,7 +1456,7 @@ def run_auto_chat(private_key: Ed25519PrivateKey, args: argparse.Namespace) -> i
     cursor = max(state["last_seq"], args.since or 0)
     recent_context: list[dict[str, Any]] = []
     if cursor == 0:
-        initial = read_room(
+        initial = read_room_resilient(
             args.room, limit=args.context, base_url=args.base_url, timeout=args.timeout
         )
         cursor = initial["last_seq"]
@@ -1279,13 +1502,38 @@ def run_auto_chat(private_key: Ed25519PrivateKey, args: argparse.Namespace) -> i
                 "status": "preview",
             }
             if args.send:
-                posted_response = post_signed_message(
-                    private_key,
-                    args.room,
-                    reply,
-                    base_url=args.base_url,
-                    timeout=args.timeout,
-                )
+                selected_nonce = next_nonce()
+                try:
+                    posted_response = post_signed_message(
+                        private_key,
+                        args.room,
+                        reply,
+                        nonce=selected_nonce,
+                        base_url=args.base_url,
+                        timeout=args.timeout,
+                    )
+                except NetworkError as error:
+                    # A write-side 5xx has an unknown outcome: it may have been
+                    # accepted before the failing response. Never resend it
+                    # blindly, but keep both automation workers alive.
+                    state["sent_at"] = list(rate_times)
+                    state["last_seq"] = cursor
+                    save_auto_state(args.state, state)
+                    result.update(
+                        {
+                            "status": "unconfirmed",
+                            "nonce": selected_nonce,
+                            "error": terminal_safe_detail(error),
+                        }
+                    )
+                    print(json.dumps(result, ensure_ascii=True), flush=True)
+                    print(
+                        f"error: auto-chat reply to {message['seq']} was not "
+                        f"confirmed: {error}; continuing to watch the room",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    continue
                 state["sent_at"] = list(rate_times)
                 sent += 1
                 state["last_seq"] = cursor
@@ -1704,7 +1952,7 @@ def run_command(args: argparse.Namespace) -> int:
             )
             cursor = args.since
             if cursor is None:
-                initial = read_room(
+                initial = read_room_resilient(
                     args.room,
                     limit=args.limit,
                     base_url=args.base_url,
