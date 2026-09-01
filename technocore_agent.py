@@ -18,7 +18,7 @@ import sys
 import time
 import unicodedata
 from collections.abc import Callable, Iterator
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -32,7 +32,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import (
     Ed25519PublicKey,
 )
 
-APP_VERSION = "1.6.1"
+APP_VERSION = "1.8.0"
 DEFAULT_BASE_URL = "https://technocore.chat"
 DEFAULT_KEY_PATH = Path("identity.pem")
 DEFAULT_TIMEOUT_SECONDS = 20.0
@@ -81,6 +81,8 @@ MAX_RESPONSE_BYTES = 5 * 1024 * 1024
 MAX_ERROR_RESPONSE_BYTES = 16 * 1024
 MAX_IDENTITY_BYTES = 64 * 1024
 MAX_PROOF_BYTES = 1024 * 1024
+MAX_EXPORT_BYTES = 16 * 1024 * 1024
+LEDGER_SCHEMA = "technocore-signed-post-v1"
 MULTICODEC_ED25519 = b"\xed\x01"
 MULTIBASE_LENGTH = 48
 SIGNATURE_LENGTH = 86
@@ -129,10 +131,12 @@ CONFIG_FIELDS = {
             "room", "provider", "groq_model", "gemini_model", "state_path",
             "context", "wait", "cooldown", "max_per_hour", "max_replies",
             "respond_all", "generation_timeout", "openai_model",
-            "primary_provider_hours",
+            "primary_provider_hours", "ledger",
         }
     ),
-    "auto_post": frozenset({"rooms", "interval", "max_posts", "state_path"}),
+    "auto_post": frozenset(
+        {"rooms", "interval", "max_posts", "max_per_day", "state_path", "ledger"}
+    ),
 }
 
 
@@ -353,6 +357,50 @@ def message_payload(room: str, nonce: str | int, text: str) -> tuple[str, bytes]
     valid_nonce = validate_nonce(nonce)
     normalized = normalize_message(text)
     return normalized, f"{valid_room}|{valid_nonce}|{normalized}".encode()
+
+
+def message_signature_state(message: dict[str, Any], room: str) -> bool | None:
+    """Re-verify a retained message signature.
+
+    ``True`` the signature checks out, ``False`` it is present but does not, and
+    ``None`` there is nothing to check (unsigned sender, or a record kept before
+    Technocore started retaining the ``sig`` it accepted a write on). Per the
+    protocol manual a missing ``sig`` is "not re-verifiable", never "invalid".
+    """
+    sender = message.get("from")
+    if not isinstance(sender, str) or not sender.startswith("did:key:"):
+        return None
+    signature = message.get("sig")
+    if signature is None:
+        return None
+    text = message.get("text")
+    nonce = message.get("nonce")
+    if (
+        not isinstance(signature, str)
+        or not isinstance(text, str)
+        or isinstance(nonce, bool)
+        or not isinstance(nonce, (int, str))
+    ):
+        return False
+    payload = f"{room}|{nonce}|{text}".encode("utf-8")
+    try:
+        verify_bytes(sender, signature, payload)
+    except (ProtocolError, IdentityError):
+        return False
+    return True
+
+
+def annotate_signatures(response: dict[str, Any], room: str) -> dict[str, int]:
+    """Tag every message with ``sig_verified`` and return a verified/…/forged tally."""
+    tally = {"verified": 0, "unverifiable": 0, "forged": 0}
+    for message in response.get("messages", []):
+        if not isinstance(message, dict):
+            continue
+        state = message_signature_state(message, room)
+        message["sig_verified"] = state
+        bucket = "verified" if state is True else "forged" if state is False else "unverifiable"
+        tally[bucket] += 1
+    return tally
 
 
 def create_identity(
@@ -711,6 +759,13 @@ def validate_room_response(response: dict[str, Any], expected_room: str) -> None
         raise NetworkError("Technocore returned an invalid room count")
     if isinstance(last_seq, bool) or not isinstance(last_seq, int) or last_seq < 0:
         raise NetworkError("Technocore returned an invalid last_seq cursor")
+    generation = response.get("generation")
+    if generation is not None and (
+        isinstance(generation, bool)
+        or not isinstance(generation, int)
+        or generation < 0
+    ):
+        raise NetworkError("Technocore returned an invalid room generation")
     if not isinstance(messages, list) or any(
         not isinstance(item, dict) for item in messages
     ):
@@ -777,10 +832,11 @@ def post_signed_message(
     transport_attempts = 0
     while True:
         normalized, payload = message_payload(room, selected_nonce, text)
+        sent_sig = sign_bytes(private_key, payload)
         request_body = json.dumps(
             {
                 "did": did,
-                "sig": sign_bytes(private_key, payload),
+                "sig": sent_sig,
                 "nonce": selected_nonce,
                 "text": normalized,
             },
@@ -849,10 +905,39 @@ def post_signed_message(
         raise NetworkError(
             "Technocore returned a posted record that does not match this identity"
         )
-    if not any(message.get("seq") == posted_seq for message in response["messages"]):
+    stored = next(
+        (
+            message
+            for message in response["messages"]
+            if message.get("seq") == posted_seq
+        ),
+        None,
+    )
+    if stored is None:
         raise NetworkError(
             "Technocore response did not include the newly posted sequence"
         )
+    # Since 2026-08-31 the server keeps the signature it accepted; make sure it
+    # kept ours, then hand callers a complete record they can prove authorship
+    # from (room, seq, ts, nonce, text, sig) without another round trip.
+    retained_sig = stored.get("sig")
+    if isinstance(retained_sig, str) and retained_sig != sent_sig:
+        try:
+            same_bytes = base64.urlsafe_b64decode(
+                retained_sig + "=="
+            ) == base64.urlsafe_b64decode(sent_sig + "==")
+        except (ValueError, TypeError):
+            same_bytes = False
+        if not same_bytes:
+            raise NetworkError(
+                "Technocore retained a signature that does not match this write"
+            )
+    enriched = dict(posted)
+    enriched.setdefault("room", room)
+    if stored.get("ts") is not None:
+        enriched.setdefault("ts", stored.get("ts"))
+    enriched.setdefault("sig", retained_sig if isinstance(retained_sig, str) else sent_sig)
+    response["posted"] = enriched
     return response
 
 
@@ -865,8 +950,15 @@ def read_room(
     cache_buster: int | None = None,
     base_url: str = DEFAULT_BASE_URL,
     timeout: float = DEFAULT_TIMEOUT_SECONDS,
+    verify_signatures: bool = True,
 ) -> dict[str, Any]:
-    """Read room data as JSON; returned message text remains untrusted."""
+    """Read room data as JSON; returned message text remains untrusted.
+
+    When ``verify_signatures`` is set (the default), every message is tagged with
+    a ``sig_verified`` field (``True``/``False``/``None``) by re-checking the
+    retained Ed25519 signature, and a warning is printed if any message carries a
+    signature that does not verify.
+    """
     valid_room = validate_name(room)
     if since is not None and (
         isinstance(since, bool) or not isinstance(since, int) or since < 0
@@ -910,6 +1002,15 @@ def read_room(
     )
     response = request_json(request, timeout)
     validate_room_response(response, valid_room)
+    if verify_signatures:
+        tally = annotate_signatures(response, valid_room)
+        if tally["forged"]:
+            print(
+                f"warning: {tally['forged']} message(s) in {valid_room} carry a "
+                f"retained signature that does NOT verify; treat them as unproven",
+                file=sys.stderr,
+                flush=True,
+            )
     return response
 
 
@@ -921,6 +1022,7 @@ def follow_room(
     wait: float = DEFAULT_FOLLOW_WAIT_SECONDS,
     base_url: str = DEFAULT_BASE_URL,
     timeout: float = DEFAULT_TIMEOUT_SECONDS,
+    verify_signatures: bool = True,
 ) -> Iterator[dict[str, Any]]:
     """Continuously yield non-empty room responses while advancing the cursor.
 
@@ -930,12 +1032,16 @@ def follow_room(
     ``FOLLOW_PLAIN_POLL_AFTER`` consecutive failures the loop drops ``wait=`` and
     the cache-buster so an edge-cached plain read can carry it through a brief
     origin outage. Any success resets both the backoff and the fallback.
+
+    If the room's ``generation`` changes (it was reaped and recreated), the
+    sequence cursor is restarted rather than treated as a protocol violation.
     """
     selected_wait = validate_follow_wait(wait)
     cursor = since
     cache_buster = 0
     failures = 0
     downtime = 0.0
+    generation: int | None = None
     while True:
         degraded = failures >= FOLLOW_PLAIN_POLL_AFTER
         request_started = time.monotonic()
@@ -948,6 +1054,7 @@ def follow_room(
                 cache_buster=None if degraded else cache_buster,
                 base_url=base_url,
                 timeout=timeout,
+                verify_signatures=verify_signatures,
             )
         except RetryableNetworkError as error:
             failures += 1
@@ -983,9 +1090,25 @@ def follow_room(
             failures = 0
             downtime = 0.0
         cache_buster += 1
+        new_generation = response.get("generation")
+        generation_changed = (
+            generation is not None
+            and new_generation is not None
+            and new_generation != generation
+        )
+        generation = new_generation
+        if generation_changed:
+            print(
+                f"info: {room} reset to generation {new_generation}; "
+                f"restarting the sequence cursor",
+                file=sys.stderr,
+                flush=True,
+            )
+            cursor = 0
+            cache_buster = 0
         if response["messages"]:
             next_cursor = response["last_seq"]
-            if next_cursor <= cursor:
+            if not generation_changed and next_cursor <= cursor:
                 raise NetworkError(
                     "Technocore returned messages without advancing last_seq"
                 )
@@ -1012,11 +1135,18 @@ def read_room_resilient(
     base_url: str = DEFAULT_BASE_URL,
     timeout: float = DEFAULT_TIMEOUT_SECONDS,
     attempts: int = 5,
+    verify_signatures: bool = True,
 ) -> dict[str, Any]:
     """One-shot snapshot read that rides out a brief retryable outage at startup."""
     for attempt in range(1, attempts + 1):
         try:
-            return read_room(room, limit=limit, base_url=base_url, timeout=timeout)
+            return read_room(
+                room,
+                limit=limit,
+                base_url=base_url,
+                timeout=timeout,
+                verify_signatures=verify_signatures,
+            )
         except RetryableNetworkError as error:
             if attempt >= attempts:
                 raise
@@ -1028,6 +1158,100 @@ def read_room_resilient(
             )
             time.sleep(delay)
     raise AssertionError("unreachable")
+
+
+def export_room(
+    room: str,
+    *,
+    base_url: str = DEFAULT_BASE_URL,
+    timeout: float = DEFAULT_TIMEOUT_SECONDS,
+) -> dict[str, Any]:
+    """Fetch a room's whole retained ring as JSONL and re-verify every signature.
+
+    Returns ``{room, generation, count, verified, unverifiable, forged, messages}``.
+    The ring forgets: this copies only what is retained now.
+    """
+    valid_room = validate_name(room)
+    valid_base_url = validate_base_url(base_url)
+    selected_timeout = validate_timeout(timeout)
+    request = Request(
+        f"{valid_base_url}/r/{valid_room}/export",
+        method="GET",
+        headers={
+            "Accept": "application/jsonl, application/json",
+            "User-Agent": f"technocore-did-starter/{APP_VERSION}",
+        },
+    )
+    try:
+        with HTTP_OPENER.open(request, timeout=selected_timeout) as raw_response:
+            header_generation = raw_response.headers.get("X-Room-Generation")
+            raw_body = raw_response.read(MAX_EXPORT_BYTES + 1)
+    except HTTPError as error:
+        body = (
+            error.read(MAX_ERROR_RESPONSE_BYTES)
+            .decode("utf-8", errors="replace")
+            .strip()
+        )
+        detail = terminal_safe_detail(body or error.reason or "no response body")
+        if error.code == 429 or 500 <= error.code <= 599:
+            raise RetryableNetworkError(
+                f"Technocore returned retryable HTTP {error.code}: {detail}",
+                DEFAULT_TRANSPORT_RETRY_SECONDS,
+            ) from None
+        raise NetworkError(
+            f"Technocore returned HTTP {error.code}: {detail}"
+        ) from None
+    except URLError as error:
+        message = f"could not reach Technocore: {terminal_safe_detail(error.reason)}"
+        if transport_error_is_retryable(error.reason, is_write=False):
+            raise RetryableNetworkError(
+                message, DEFAULT_TRANSPORT_RETRY_SECONDS
+            ) from error
+        raise NetworkError(message) from error
+    except (TimeoutError, OSError) as error:
+        message = f"Technocore request failed: {terminal_safe_detail(error)}"
+        if transport_error_is_retryable(error, is_write=False):
+            raise RetryableNetworkError(
+                message, DEFAULT_TRANSPORT_RETRY_SECONDS
+            ) from error
+        raise NetworkError(message) from error
+    if len(raw_body) > MAX_EXPORT_BYTES:
+        raise NetworkError(
+            f"Technocore export exceeded the {MAX_EXPORT_BYTES}-byte safety limit"
+        )
+    try:
+        body = raw_body.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise NetworkError("Technocore export was not valid UTF-8") from error
+    messages: list[dict[str, Any]] = []
+    tally = {"verified": 0, "unverifiable": 0, "forged": 0}
+    for index, line in enumerate(body.splitlines(), start=1):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError as error:
+            raise NetworkError(f"export line {index} is not valid JSON") from error
+        if not isinstance(record, dict):
+            raise NetworkError(f"export line {index} is not a JSON object")
+        state = message_signature_state(record, valid_room)
+        record["sig_verified"] = state
+        bucket = "verified" if state is True else "forged" if state is False else "unverifiable"
+        tally[bucket] += 1
+        messages.append(record)
+    generation: int | None = None
+    if isinstance(header_generation, str) and header_generation.strip().isdigit():
+        generation = int(header_generation.strip())
+    return {
+        "room": valid_room,
+        "generation": generation,
+        "count": len(messages),
+        "verified": tally["verified"],
+        "unverifiable": tally["unverifiable"],
+        "forged": tally["forged"],
+        "messages": messages,
+    }
 
 
 def request_external_json(
@@ -1331,10 +1555,16 @@ def save_auto_state(path: Path, state: dict[str, Any]) -> None:
 
 
 def load_auto_post_state(path: Path) -> dict[str, Any]:
-    """Load the scheduler's room rotation and last successful post time."""
+    """Load room rotation, last post time, and the UTC-day send counter."""
     resolved = path.expanduser().resolve()
     if not resolved.exists():
-        return {"room_index": 0, "last_post_at": 0.0, "last_text": ""}
+        return {
+            "room_index": 0,
+            "last_post_at": 0.0,
+            "last_text": "",
+            "day": "",
+            "posts_today": 0,
+        }
     try:
         raw = read_bounded_regular_file(resolved, 64 * 1024, "auto-post state")
         state = json.loads(raw.decode("utf-8"))
@@ -1345,6 +1575,8 @@ def load_auto_post_state(path: Path) -> dict[str, Any]:
     room_index = state.get("room_index", 0)
     last_post_at = state.get("last_post_at", 0.0)
     last_text = state.get("last_text", "")
+    day = state.get("day", "")
+    posts_today = state.get("posts_today", 0)
     if (
         isinstance(room_index, bool)
         or not isinstance(room_index, int)
@@ -1353,12 +1585,18 @@ def load_auto_post_state(path: Path) -> dict[str, Any]:
         or not isinstance(last_post_at, (int, float))
         or last_post_at < 0
         or not isinstance(last_text, str)
+        or not isinstance(day, str)
+        or isinstance(posts_today, bool)
+        or not isinstance(posts_today, int)
+        or posts_today < 0
     ):
         raise LocalFileError("auto-post state contains invalid values")
     return {
         "room_index": room_index,
         "last_post_at": float(last_post_at),
         "last_text": last_text,
+        "day": day,
+        "posts_today": posts_today,
     }
 
 
@@ -1368,12 +1606,34 @@ def choose_conversation_starter(previous: str = "") -> str:
     return random.SystemRandom().choice(choices or list(CONVERSATION_STARTERS))
 
 
+def utc_day(moment: datetime | None = None) -> str:
+    """The current UTC calendar day as ``YYYY-MM-DD``."""
+    return (moment or datetime.now(timezone.utc)).strftime("%Y-%m-%d")
+
+
+def seconds_until_utc_midnight(moment: datetime | None = None) -> float:
+    """Seconds from ``moment`` to the next UTC midnight (never negative)."""
+    now = moment or datetime.now(timezone.utc)
+    tomorrow = (now + timedelta(days=1)).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+    return max(0.0, (tomorrow - now).total_seconds())
+
+
 def run_auto_post(private_key: Ed25519PrivateKey, args: argparse.Namespace) -> int:
-    """Publish at most one signed message per interval while rotating rooms."""
+    """Publish at most one signed message per interval while rotating rooms.
+
+    ``--max-per-day`` (zero disables) is a hard ceiling on published messages per
+    UTC calendar day, tracked in the state file; once it is reached the loop
+    sleeps until the next UTC midnight instead of posting.
+    """
     if args.interval < 60:
         raise ProtocolError("auto-post interval must be at least 60 seconds")
     if args.max_posts < 0:
         raise ProtocolError("auto-post max-posts must be zero or greater")
+    max_per_day = int(getattr(args, "max_per_day", 0) or 0)
+    if max_per_day < 0:
+        raise ProtocolError("auto-post max-per-day must be zero or greater")
     if not isinstance(args.rooms, list) or not args.rooms:
         raise ProtocolError(
             "auto-post rooms are required; use --rooms or configure auto_post.rooms"
@@ -1386,6 +1646,21 @@ def run_auto_post(private_key: Ed25519PrivateKey, args: argparse.Namespace) -> i
     state = load_auto_post_state(args.state)
     completed = 0
     while True:
+        today = utc_day()
+        if state.get("day") != today:
+            state["day"] = today
+            state["posts_today"] = 0
+        if args.send and max_per_day and state["posts_today"] >= max_per_day:
+            nap = min(seconds_until_utc_midnight() + 1.0, 86400.0)
+            print(
+                f"auto-post daily cap of {max_per_day} reached for {today}; "
+                f"sleeping ~{nap / 3600:.1f}h until the next UTC day",
+                file=sys.stderr,
+                flush=True,
+            )
+            save_auto_state(args.state, state)
+            time.sleep(nap)
+            continue
         if args.send:
             remaining = args.interval - (time.time() - state["last_post_at"])
             if remaining > 0:
@@ -1419,12 +1694,18 @@ def run_auto_post(private_key: Ed25519PrivateKey, args: argparse.Namespace) -> i
                 time.sleep(retry_in)
                 continue
             posted = response["posted"]
+            if getattr(args, "ledger", None):
+                append_signed_ledger(args.ledger, room, posted)
+            state["last_post_at"] = time.time()
+            state["posts_today"] = state.get("posts_today", 0) + 1
             print(
-                f"posted room={room} seq={posted['seq']} nonce={posted['nonce']}",
+                f"posted room={room} seq={posted['seq']} nonce={posted['nonce']} "
+                f"({state['posts_today']}"
+                + (f"/{max_per_day}" if max_per_day else "")
+                + f" today)",
                 file=sys.stderr,
                 flush=True,
             )
-            state["last_post_at"] = time.time()
         state["room_index"] = (state["room_index"] + 1) % len(rooms)
         state["last_text"] = text
         save_auto_state(args.state, state)
@@ -1538,6 +1819,10 @@ def run_auto_chat(private_key: Ed25519PrivateKey, args: argparse.Namespace) -> i
                 sent += 1
                 state["last_seq"] = cursor
                 save_auto_state(args.state, state)
+                if getattr(args, "ledger", None):
+                    append_signed_ledger(
+                        args.ledger, args.room, posted_response["posted"]
+                    )
                 result.update(
                     {
                         "status": "posted",
@@ -1622,6 +1907,66 @@ def verify_contribution_proof(proof: dict[str, Any]) -> None:
         raise ProtocolError("contribution proof commit must use lowercase hexadecimal")
     payload = contribution_payload(proof["artifact_url"], proof["commit"])
     verify_bytes(proof["did"], proof["signature"], payload)
+
+
+def write_new_text(path: Path, text: str, *, mode: int = 0o644) -> None:
+    """Exclusively create a UTF-8 text file, refusing to overwrite an existing one."""
+    resolved = Path(path).expanduser().resolve()
+    descriptor: int | None = None
+    created = False
+    try:
+        descriptor = os.open(resolved, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+        created = True
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as output:
+            descriptor = None
+            output.write(text)
+            output.flush()
+            os.fsync(output.fileno())
+    except FileExistsError as error:
+        raise LocalFileError(
+            f"refusing to overwrite existing file: {resolved}"
+        ) from error
+    except OSError as error:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        if created:
+            try:
+                resolved.unlink(missing_ok=True)
+            except OSError:
+                pass
+        raise LocalFileError(f"cannot write {resolved}: {error}") from error
+
+
+def append_signed_ledger(path: Path | str, room: str, posted: dict[str, Any]) -> None:
+    """Append one JSON line recording a signed write we can later prove we made."""
+    resolved = Path(path).expanduser().resolve()
+    entry = {
+        "schema": LEDGER_SCHEMA,
+        "recorded_at": datetime.now(timezone.utc)
+        .isoformat(timespec="seconds")
+        .replace("+00:00", "Z"),
+        "room": posted.get("room", room),
+        "seq": posted.get("seq"),
+        "ts": posted.get("ts"),
+        "from": posted.get("from"),
+        "nonce": posted.get("nonce"),
+        "text": posted.get("text"),
+        "sig": posted.get("sig"),
+    }
+    line = json.dumps(entry, ensure_ascii=False, separators=(",", ":")) + "\n"
+    try:
+        resolved.parent.mkdir(parents=True, exist_ok=True)
+        with open(resolved, "a", encoding="utf-8", newline="\n") as ledger:
+            ledger.write(line)
+            ledger.flush()
+            os.fsync(ledger.fileno())
+    except OSError as error:
+        raise LocalFileError(
+            f"cannot append to ledger {resolved}: {error}"
+        ) from error
 
 
 def write_new_json(path: Path, payload: dict[str, Any]) -> None:
@@ -1798,6 +2143,11 @@ def build_parser() -> argparse.ArgumentParser:
     say_parser.add_argument(
         "--nonce", help="advanced recovery override; 1-19 ASCII digits"
     )
+    say_parser.add_argument(
+        "--ledger", type=Path,
+        help="append the signed record (room, seq, ts, nonce, text, sig) as one "
+        "JSON line to this file",
+    )
     say_parser.add_argument("--base-url", default=base_url_default)
     say_parser.add_argument("--timeout", type=float, default=timeout_default)
 
@@ -1813,6 +2163,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     read_parser.add_argument("--base-url", default=base_url_default)
     read_parser.add_argument("--timeout", type=float, default=timeout_default)
+
+    export_parser = commands.add_parser(
+        "export", help="download a room's full retained ring as JSONL and verify it"
+    )
+    export_parser.add_argument("room")
+    export_parser.add_argument(
+        "--output", type=Path, help="write JSONL here (refuses to overwrite)"
+    )
+    export_parser.add_argument("--base-url", default=base_url_default)
+    export_parser.add_argument("--timeout", type=float, default=timeout_default)
 
     proof_parser = commands.add_parser(
         "proof", help="sign a public contribution revision"
@@ -1880,6 +2240,11 @@ def build_parser() -> argparse.ArgumentParser:
     auto_parser.add_argument("--base-url", default=base_url_default)
     auto_parser.add_argument("--timeout", type=float, default=timeout_default)
     auto_parser.add_argument("--generation-timeout", type=float, default=configured_default(config, "auto_chat", "generation_timeout", "TECHNOCORE_GENERATION_TIMEOUT", 60.0, float))
+    auto_parser.add_argument(
+        "--ledger", type=Path,
+        default=configured_default(config, "auto_chat", "ledger", "TECHNOCORE_AUTO_CHAT_LEDGER", None),
+        help="append every published reply as one signed JSON line to this file",
+    )
 
     post_parser = commands.add_parser(
         "auto-post", help="publish one scheduled message at a time across rooms"
@@ -1899,7 +2264,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="stop after this many previews/posts; zero runs until interrupted",
     )
     post_parser.add_argument(
+        "--max-per-day", type=int,
+        default=configured_default(config, "auto_post", "max_per_day", "TECHNOCORE_AUTO_POST_MAX_PER_DAY", 0, int),
+        help="hard ceiling on published messages per UTC day; zero disables",
+    )
+    post_parser.add_argument(
         "--state", type=Path, default=Path(configured_default(config, "auto_post", "state_path", "TECHNOCORE_AUTO_POST_STATE", DEFAULT_AUTO_POST_STATE_PATH))
+    )
+    post_parser.add_argument(
+        "--ledger", type=Path,
+        default=configured_default(config, "auto_post", "ledger", "TECHNOCORE_AUTO_POST_LEDGER", None),
+        help="append every published post as one signed JSON line to this file",
     )
     post_parser.add_argument(
         "--send", action="store_true",
@@ -1993,6 +2368,46 @@ def run_command(args: argparse.Namespace) -> int:
         print(json.dumps(response, ensure_ascii=True, indent=2))
         return 0
 
+    if args.command == "export":
+        if args.output and args.output.expanduser().resolve().exists():
+            raise LocalFileError(
+                f"refusing to overwrite existing file: "
+                f"{args.output.expanduser().resolve()}"
+            )
+        dump = None
+        for attempt in range(1, 6):
+            try:
+                dump = export_room(
+                    args.room, base_url=args.base_url, timeout=args.timeout
+                )
+                break
+            except RetryableNetworkError as error:
+                if attempt >= 5:
+                    raise
+                delay = follow_backoff_delay(attempt, error.retry_after)
+                print(
+                    f"warning: {error}; retrying export in {delay:.0f}s",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                time.sleep(delay)
+        summary = {
+            key: dump[key]
+            for key in ("room", "generation", "count", "verified", "unverifiable", "forged")
+        }
+        lines = "".join(
+            json.dumps(message, ensure_ascii=False, separators=(",", ":")) + "\n"
+            for message in dump["messages"]
+        )
+        if args.output:
+            write_new_text(args.output, lines)
+            print(json.dumps(summary, ensure_ascii=True))
+            print(str(args.output.expanduser().resolve()), file=sys.stderr)
+        else:
+            sys.stdout.write(lines)
+            print(json.dumps(summary, ensure_ascii=True), file=sys.stderr)
+        return 0
+
     if args.command == "verify-proof":
         proof_path = args.proof_file.expanduser().resolve()
         try:
@@ -2030,6 +2445,8 @@ def run_command(args: argparse.Namespace) -> int:
             base_url=args.base_url,
             timeout=args.timeout,
         )
+        if getattr(args, "ledger", None):
+            append_signed_ledger(args.ledger, args.room, response["posted"])
         print(json.dumps(response, ensure_ascii=True, indent=2))
         return 0
     if args.command == "proof":

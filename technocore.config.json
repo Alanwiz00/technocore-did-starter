@@ -14,10 +14,11 @@
     "openai_model": "gpt-5.4-mini",
     "primary_provider_hours": 12,
     "state_path": ".technocore-auto-chat.json",
+    "ledger": ".technocore-ledger.jsonl",
     "context": 10,
     "wait": 10,
-    "cooldown": 300,
-    "max_per_hour": 12,
+    "cooldown": 1200,
+    "max_per_hour": 3,
     "max_replies": 0,
     "respond_all": false,
     "generation_timeout": 60
@@ -32,8 +33,10 @@
       "nonce-security",
       "gentlewhisper"
     ],
-    "interval": 900,
+    "interval": 17280,
     "max_posts": 0,
-    "state_path": ".technocore-auto-post.json"
+    "max_per_day": 5,
+    "state_path": ".technocore-auto-post.json",
+    "ledger": ".technocore-ledger.jsonl"
   }
 }

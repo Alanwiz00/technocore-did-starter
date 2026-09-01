@@ -7,9 +7,9 @@ __pycache__/
 # Technocore identity
 *.pem
 *.key
-.technocore-auto-chat.json
-.technocore-auto-post.json
+.technocore-*
 .env
+.env.bak.*
 
 # Local editor files
 .idea/

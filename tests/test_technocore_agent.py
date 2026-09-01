@@ -4,6 +4,7 @@ import io
 import os
 import socket
 import tempfile
+import threading
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
@@ -809,6 +810,276 @@ class AutoPostTests(unittest.TestCase):
             )
             self.assertIn("auto-post to chat failed", errors.getvalue())
             self.assertEqual(agent.load_auto_post_state(args.state)["room_index"], 1)
+
+    def test_auto_post_state_round_trips_the_daily_counter(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.json"
+            agent.save_auto_state(path, {
+                "room_index": 2, "last_post_at": 5.0, "last_text": "hi",
+                "day": "2026-09-01", "posts_today": 3,
+            })
+            loaded = agent.load_auto_post_state(path)
+            self.assertEqual(loaded["day"], "2026-09-01")
+            self.assertEqual(loaded["posts_today"], 3)
+            agent.save_auto_state(path, {**loaded, "posts_today": -1})
+            with self.assertRaisesRegex(agent.LocalFileError, "invalid values"):
+                agent.load_auto_post_state(path)
+
+    def test_auto_post_stops_posting_once_the_daily_cap_is_reached(self):
+        key = Ed25519PrivateKey.generate()
+        with tempfile.TemporaryDirectory() as directory:
+            args = SimpleNamespace(
+                interval=60.0, max_posts=0, max_per_day=1,
+                rooms=["chat", "lobby"],
+                state=Path(directory) / "post-state.json", send=True,
+                base_url=agent.DEFAULT_BASE_URL, timeout=1.0, ledger=None,
+            )
+            posted = {"posted": {"seq": 5, "nonce": "123", "sig": "z" * 86}}
+            with patch.object(
+                agent, "post_signed_message", return_value=posted
+            ) as post, patch.object(
+                agent.time, "sleep", side_effect=KeyboardInterrupt
+            ), redirect_stdout(io.StringIO()), patch(
+                "sys.stderr", new=io.StringIO()
+            ) as errors:
+                with self.assertRaises(KeyboardInterrupt):
+                    agent.run_auto_post(key, args)
+            self.assertEqual(post.call_count, 1)
+            self.assertIn("daily cap of 1 reached", errors.getvalue())
+            self.assertEqual(agent.load_auto_post_state(args.state)["posts_today"], 1)
+
+    def test_seconds_until_utc_midnight_is_bounded(self):
+        from datetime import datetime, timezone
+
+        noon = datetime(2026, 9, 1, 12, 0, 0, tzinfo=timezone.utc)
+        self.assertEqual(agent.seconds_until_utc_midnight(noon), 12 * 3600)
+        self.assertEqual(agent.utc_day(noon), "2026-09-01")
+
+
+class RunnerSupervisorTests(unittest.TestCase):
+    def _run(self, operation):
+        shutdown = threading.Event()
+        outcomes = {}
+        with patch.object(shutdown, "wait", return_value=False), patch(
+            "sys.stderr", new=io.StringIO()
+        ):
+            runner.supervise("w", operation, shutdown, outcomes)
+        return outcomes
+
+    def test_transient_crash_is_retried_then_settles(self):
+        calls = {"n": 0}
+
+        def flaky():
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise ValueError("boom")
+            return 0
+
+        self.assertEqual(self._run(flaky), {"w": "done"})
+        self.assertEqual(calls["n"], 2)
+
+    def test_misconfiguration_disables_the_worker_without_retry(self):
+        calls = {"n": 0}
+
+        def broken():
+            calls["n"] += 1
+            raise agent.ProtocolError("auto-post rooms are required")
+
+        self.assertEqual(self._run(broken), {"w": "fatal"})
+        self.assertEqual(calls["n"], 1)
+
+    def test_clean_return_ends_the_worker(self):
+        self.assertEqual(self._run(lambda: 0), {"w": "done"})
+
+    def test_backoff_grows_across_repeated_crashes(self):
+        shutdown = threading.Event()
+        outcomes = {}
+        waits = []
+        attempts = {"n": 0}
+
+        def wait(timeout=None):
+            waits.append(timeout)
+            return len(waits) >= 3  # let the third backoff end the worker
+
+        def always_crashes():
+            attempts["n"] += 1
+            raise RuntimeError("boom")
+
+        with patch.object(shutdown, "wait", side_effect=wait), patch(
+            "sys.stderr", new=io.StringIO()
+        ):
+            runner.supervise("w", always_crashes, shutdown, outcomes)
+        self.assertEqual(waits, [5.0, 10.0, 20.0])
+        self.assertEqual(attempts["n"], 3)
+
+
+class RetainedSignatureTests(unittest.TestCase):
+    def setUp(self):
+        self.key = Ed25519PrivateKey.generate()
+        self.did = agent.did_from_private_key(self.key)
+
+    def _msg(self, room, nonce, text, seq=1):
+        normalized, payload = agent.message_payload(room, nonce, text)
+        return {
+            "seq": seq,
+            "ts": "2026-09-01T00:00:00Z",
+            "from": self.did,
+            "text": normalized,
+            "nonce": int(nonce),
+            "sig": agent.sign_bytes(self.key, payload),
+        }
+
+    def test_message_signature_state_verifies_forges_and_abstains(self):
+        good = self._msg("chat", 5, "hello world")
+        self.assertIs(agent.message_signature_state(good, "chat"), True)
+        self.assertIs(
+            agent.message_signature_state({**good, "text": "tampered"}, "chat"), False
+        )
+        self.assertIs(agent.message_signature_state(good, "lobby"), False)
+        self.assertIsNone(agent.message_signature_state({**good, "sig": None}, "chat"))
+        self.assertIsNone(
+            agent.message_signature_state({"from": "human", "text": "hi"}, "chat")
+        )
+
+    def test_read_room_tags_messages_and_warns_on_bad_signature(self):
+        good = self._msg("chat", 5, "verified", seq=5)
+        bad = {**self._msg("chat", 6, "forged", seq=6), "sig": "A" * 86}
+        payload = {"room": "chat", "count": 2, "last_seq": 6, "messages": [good, bad]}
+        with patch.object(agent, "request_json", return_value=payload), patch(
+            "sys.stderr", new=io.StringIO()
+        ) as err:
+            out = agent.read_room("chat")
+        self.assertIs(out["messages"][0]["sig_verified"], True)
+        self.assertIs(out["messages"][1]["sig_verified"], False)
+        self.assertIn("does NOT verify", err.getvalue())
+
+    def test_validate_room_response_rejects_a_bad_generation(self):
+        payload = {
+            "room": "chat", "count": 0, "last_seq": 1,
+            "generation": -1, "messages": [],
+        }
+        with self.assertRaisesRegex(agent.NetworkError, "generation"):
+            agent.validate_room_response(payload, "chat")
+
+    def test_follow_room_restarts_cursor_on_generation_change(self):
+        first = {
+            "room": "chat", "count": 1, "last_seq": 90, "generation": 3,
+            "messages": [{"seq": 90, "from": "human", "text": "old epoch"}],
+        }
+        second = {
+            "room": "chat", "count": 1, "last_seq": 2, "generation": 4,
+            "messages": [{"seq": 2, "from": "human", "text": "new epoch"}],
+        }
+        with patch.object(
+            agent, "read_room", side_effect=[first, second]
+        ), patch.object(agent.time, "sleep"), patch("sys.stderr", new=io.StringIO()):
+            stream = agent.follow_room("chat", since=80, wait=1, timeout=2)
+            self.assertEqual(next(stream), first)
+            self.assertEqual(next(stream), second)
+
+    def test_post_enriches_the_posted_record_with_ts_and_sig(self):
+        def fake(request, timeout, *, is_write=False):
+            body = json.loads(request.data.decode("utf-8"))
+            message = {
+                "seq": 9, "ts": "2026-09-01T09:00:00Z", "from": body["did"],
+                "text": body["text"], "nonce": int(body["nonce"]), "sig": body["sig"],
+            }
+            return {
+                "room": "chat", "count": 1, "last_seq": 9, "messages": [message],
+                "posted": {
+                    "seq": 9, "from": body["did"],
+                    "text": body["text"], "nonce": body["nonce"],
+                },
+            }
+
+        with patch.object(agent, "request_json", side_effect=fake):
+            response = agent.post_signed_message(self.key, "chat", "hello world", nonce=7)
+        posted = response["posted"]
+        self.assertEqual(posted["ts"], "2026-09-01T09:00:00Z")
+        self.assertEqual(posted["room"], "chat")
+        self.assertRegex(posted["sig"], r"\A[A-Za-z0-9_-]{86}\Z")
+
+    def test_post_rejects_a_swapped_retained_signature(self):
+        other = Ed25519PrivateKey.generate()
+
+        def fake(request, timeout, *, is_write=False):
+            body = json.loads(request.data.decode("utf-8"))
+            _, payload = agent.message_payload("chat", body["nonce"], body["text"])
+            bogus = agent.sign_bytes(other, payload)
+            message = {
+                "seq": 9, "from": body["did"], "text": body["text"],
+                "nonce": int(body["nonce"]), "sig": bogus,
+            }
+            return {
+                "room": "chat", "count": 1, "last_seq": 9, "messages": [message],
+                "posted": {
+                    "seq": 9, "from": body["did"], "text": body["text"],
+                    "nonce": body["nonce"], "sig": bogus,
+                },
+            }
+
+        with patch.object(agent, "request_json", side_effect=fake):
+            with self.assertRaisesRegex(agent.NetworkError, "does not match this write"):
+                agent.post_signed_message(self.key, "chat", "hello world", nonce=7)
+
+    def test_append_signed_ledger_appends_one_line_per_post(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "nested" / "ledger.jsonl"
+            agent.append_signed_ledger(
+                path, "chat",
+                {"room": "chat", "seq": 1, "ts": "t1", "from": self.did,
+                 "nonce": "10", "text": "one", "sig": "s1"},
+            )
+            agent.append_signed_ledger(
+                path, "lobby",
+                {"seq": 2, "ts": "t2", "from": self.did,
+                 "nonce": "11", "text": "two", "sig": "s2"},
+            )
+            lines = path.read_text().splitlines()
+        self.assertEqual(len(lines), 2)
+        first = json.loads(lines[0])
+        self.assertEqual(first["schema"], agent.LEDGER_SCHEMA)
+        self.assertEqual((first["room"], first["seq"], first["sig"]), ("chat", 1, "s1"))
+        self.assertEqual(json.loads(lines[1])["room"], "lobby")
+
+    def test_export_room_parses_jsonl_verifies_and_tallies(self):
+        good = self._msg("chat", 5, "kept", seq=5)
+        bad = {**self._msg("chat", 6, "x", seq=6), "sig": "B" * 86}
+        jsonl = (json.dumps(good) + "\n" + json.dumps(bad) + "\n").encode("utf-8")
+        opened = MagicMock()
+        stream = opened.__enter__.return_value
+        stream.read.return_value = jsonl
+        stream.headers.get.return_value = "4"
+        with patch.object(agent.HTTP_OPENER, "open", return_value=opened):
+            dump = agent.export_room("chat")
+        self.assertEqual(dump["count"], 2)
+        self.assertEqual((dump["verified"], dump["forged"]), (1, 1))
+        self.assertEqual(dump["generation"], 4)
+        self.assertIs(dump["messages"][0]["sig_verified"], True)
+
+    def test_auto_post_ledger_records_each_send(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = Path(directory) / "posts.jsonl"
+            args = SimpleNamespace(
+                interval=60.0, max_posts=1, rooms=["chat", "lobby"],
+                state=Path(directory) / "state.json", send=True,
+                base_url=agent.DEFAULT_BASE_URL, timeout=1.0, ledger=ledger,
+            )
+            posted = {
+                "posted": {
+                    "room": "chat", "seq": 5, "ts": "2026-09-01T09:00:00Z",
+                    "from": self.did, "nonce": "123", "text": "hi", "sig": "z" * 86,
+                }
+            }
+            with patch.object(
+                agent, "post_signed_message", return_value=posted
+            ), patch.object(agent.time, "sleep"), redirect_stdout(io.StringIO()), patch(
+                "sys.stderr", new=io.StringIO()
+            ):
+                self.assertEqual(agent.run_auto_post(self.key, args), 0)
+            entry = json.loads(ledger.read_text().splitlines()[0])
+            self.assertEqual(entry["seq"], 5)
+            self.assertEqual(entry["schema"], agent.LEDGER_SCHEMA)
 
 
 class ConfigurationTests(unittest.TestCase):
