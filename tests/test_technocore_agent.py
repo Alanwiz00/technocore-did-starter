@@ -574,9 +574,50 @@ class AutoChatTests(unittest.TestCase):
         self.assertEqual(groq_request.get_header("User-agent"), expected_agent)
         self.assertEqual(gemini_request.get_header("User-agent"), expected_agent)
         self.assertIn(b'"model":"openai/gpt-oss-20b"', groq_request.data)
+        self.assertIn(b'"reasoning_effort":"low"', groq_request.data)
+        self.assertIn(b'"max_completion_tokens":512', groq_request.data)
         self.assertIn("gemini-3.7-flash", gemini_request.full_url)
         self.assertIn(b'"thinkingLevel":"low"', gemini_request.data)
-        self.assertIn(b'"maxOutputTokens":512', gemini_request.data)
+        self.assertIn(b'"maxOutputTokens":1024', gemini_request.data)
+
+    def test_truncated_provider_output_is_rejected_not_posted(self):
+        cut = "Thanks for the update! Looks like the Technocore"
+        groq_truncated = MagicMock()
+        groq_truncated.__enter__.return_value.read.return_value = json.dumps(
+            {"choices": [{"message": {"content": cut}, "finish_reason": "length"}]}
+        ).encode()
+        with patch.object(agent.HTTP_OPENER, "open", return_value=groq_truncated):
+            with self.assertRaisesRegex(agent.NetworkError, "truncated"):
+                agent.generate_groq_reply(
+                    [{"from": "human", "text": "hi"}], "secret",
+                    agent.DEFAULT_GROQ_MODEL, 1,
+                )
+
+        gemini_truncated = MagicMock()
+        gemini_truncated.__enter__.return_value.read.return_value = json.dumps(
+            {"candidates": [
+                {"content": {"parts": [{"text": cut}]}, "finishReason": "MAX_TOKENS"}
+            ]}
+        ).encode()
+        with patch.object(agent.HTTP_OPENER, "open", return_value=gemini_truncated):
+            with self.assertRaisesRegex(agent.NetworkError, "truncated"):
+                agent.generate_gemini_reply(
+                    [{"from": "human", "text": "hi"}], "secret",
+                    agent.DEFAULT_GEMINI_MODEL, 1,
+                )
+
+        openai_incomplete = MagicMock()
+        openai_incomplete.__enter__.return_value.read.return_value = json.dumps(
+            {"status": "incomplete",
+             "incomplete_details": {"reason": "max_output_tokens"},
+             "output_text": cut}
+        ).encode()
+        with patch.object(agent.HTTP_OPENER, "open", return_value=openai_incomplete):
+            with self.assertRaisesRegex(agent.NetworkError, "incomplete"):
+                agent.generate_openai_reply(
+                    [{"from": "human", "text": "hi"}], "secret",
+                    agent.DEFAULT_OPENAI_MODEL, 1,
+                )
 
     def test_openai_response_request_and_nested_output(self):
         context = [{"from": "human", "text": "What should we test?"}]
@@ -597,6 +638,23 @@ class AutoChatTests(unittest.TestCase):
         self.assertEqual(request.full_url, "https://api.openai.com/v1/responses")
         self.assertIn(b'"model":"gpt-5.4-mini"', request.data)
         self.assertIn(b'"store":false', request.data)
+
+    def test_provider_429_reads_the_wait_from_the_body_when_no_header(self):
+        body = json.dumps({"error": {
+            "message": "Rate limit reached for model X on tokens per day (TPD): "
+                       "Limit 200000, Used 199480. Please try again in 5m31.344s.",
+            "code": "rate_limit_exceeded",
+        }}).encode()
+        error = HTTPError(
+            "https://api.groq.com/openai/v1/chat/completions", 429,
+            "Too Many Requests", {}, io.BytesIO(body),
+        )
+        with patch.object(agent.HTTP_OPENER, "open", side_effect=error):
+            with self.assertRaises(agent.ProviderNetworkError) as raised:
+                agent.request_external_json(
+                    Request("https://api.groq.com/openai/v1/chat/completions"), 1, "Groq"
+                )
+        self.assertAlmostEqual(raised.exception.retry_after, 331.344, places=2)
 
     def test_auto_provider_uses_twelve_hour_schedule_and_fallback(self):
         context = [{"from": "human", "text": "Any ideas?"}]
@@ -811,21 +869,25 @@ class AutoPostTests(unittest.TestCase):
             self.assertIn("auto-post to chat failed", errors.getvalue())
             self.assertEqual(agent.load_auto_post_state(args.state)["room_index"], 1)
 
-    def test_auto_post_state_round_trips_the_daily_counter(self):
+    def test_auto_post_state_round_trips_per_room_counts(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "state.json"
             agent.save_auto_state(path, {
                 "room_index": 2, "last_post_at": 5.0, "last_text": "hi",
-                "day": "2026-09-01", "posts_today": 3,
+                "day": "2026-09-01", "posts_today": {"chat": 3, "technocore": 1},
             })
             loaded = agent.load_auto_post_state(path)
             self.assertEqual(loaded["day"], "2026-09-01")
-            self.assertEqual(loaded["posts_today"], 3)
-            agent.save_auto_state(path, {**loaded, "posts_today": -1})
+            self.assertEqual(loaded["posts_today"], {"chat": 3, "technocore": 1})
+            # the flat integer written by an earlier build resets, never crashes
+            agent.save_auto_state(path, {**loaded, "posts_today": 7})
+            self.assertEqual(agent.load_auto_post_state(path)["posts_today"], {})
+            # a genuinely corrupt per-room count is still rejected
+            agent.save_auto_state(path, {**loaded, "posts_today": {"chat": -1}})
             with self.assertRaisesRegex(agent.LocalFileError, "invalid values"):
                 agent.load_auto_post_state(path)
 
-    def test_auto_post_stops_posting_once_the_daily_cap_is_reached(self):
+    def test_auto_post_daily_cap_is_per_room(self):
         key = Ed25519PrivateKey.generate()
         with tempfile.TemporaryDirectory() as directory:
             args = SimpleNamespace(
@@ -835,18 +897,32 @@ class AutoPostTests(unittest.TestCase):
                 base_url=agent.DEFAULT_BASE_URL, timeout=1.0, ledger=None,
             )
             posted = {"posted": {"seq": 5, "nonce": "123", "sig": "z" * 86}}
+
+            def sleep(seconds):
+                if seconds > 40000:  # the sleep-until-UTC-midnight nap
+                    raise KeyboardInterrupt
+
             with patch.object(
                 agent, "post_signed_message", return_value=posted
             ) as post, patch.object(
-                agent.time, "sleep", side_effect=KeyboardInterrupt
+                agent, "seconds_until_utc_midnight", return_value=50000.0
+            ), patch.object(
+                agent.time, "sleep", side_effect=sleep
             ), redirect_stdout(io.StringIO()), patch(
                 "sys.stderr", new=io.StringIO()
             ) as errors:
                 with self.assertRaises(KeyboardInterrupt):
                     agent.run_auto_post(key, args)
-            self.assertEqual(post.call_count, 1)
-            self.assertIn("daily cap of 1 reached", errors.getvalue())
-            self.assertEqual(agent.load_auto_post_state(args.state)["posts_today"], 1)
+            # one post to each room (cap is per room), then the whole-day nap
+            self.assertEqual(post.call_count, 2)
+            self.assertEqual(
+                [call.args[1] for call in post.call_args_list], ["chat", "lobby"]
+            )
+            self.assertIn("1/room reached for every room", errors.getvalue())
+            self.assertEqual(
+                agent.load_auto_post_state(args.state)["posts_today"],
+                {"chat": 1, "lobby": 1},
+            )
 
     def test_seconds_until_utc_midnight_is_bounded(self):
         from datetime import datetime, timezone
@@ -911,6 +987,43 @@ class RunnerSupervisorTests(unittest.TestCase):
             runner.supervise("w", always_crashes, shutdown, outcomes)
         self.assertEqual(waits, [5.0, 10.0, 20.0])
         self.assertEqual(attempts["n"], 3)
+
+    def test_resolve_home_room_prefers_env_then_config_then_empty(self):
+        self.assertEqual(
+            runner.resolve_home_room({}, {"TECHNOCORE_HOME_ROOM": " p-abc123 "}),
+            "p-abc123",
+        )
+        self.assertEqual(
+            runner.resolve_home_room({"auto_chat": {"home_room": "p-fromcfg"}}, {}),
+            "p-fromcfg",
+        )
+        self.assertEqual(
+            runner.resolve_home_room(
+                {"auto_chat": {"home_room": "p-fromcfg"}},
+                {"TECHNOCORE_HOME_ROOM": "p-fromenv"},
+            ),
+            "p-fromenv",
+        )
+        self.assertEqual(runner.resolve_home_room({}, {}), "")
+        self.assertEqual(runner.resolve_home_room({}, {"TECHNOCORE_HOME_ROOM": "  "}), "")
+        self.assertEqual(
+            runner.resolve_home_room(
+                {"auto_chat": {"home_room": "p-shared"}},
+                {"TECHNOCORE_HOME_ROOM": "none"},
+            ),
+            "",
+        )
+        with self.assertRaises(agent.ProtocolError):
+            runner.resolve_home_room({}, {"TECHNOCORE_HOME_ROOM": "Not A Room"})
+
+    def test_home_state_path_never_collides_with_the_main_cursor(self):
+        with tempfile.TemporaryDirectory() as directory:
+            main_state = Path(directory) / ".technocore-auto-chat.json"
+            home = runner.home_state_path(main_state, "p-279e665f44a04f1f3dd2b320")
+            self.assertNotEqual(home, main_state)
+            self.assertEqual(home.parent, main_state.parent)
+            self.assertTrue(home.name.startswith(".technocore-"))
+            self.assertIn("p-279e665f44a04f1f3dd2b320", home.name)
 
 
 class RetainedSignatureTests(unittest.TestCase):

@@ -15,6 +15,7 @@
     "primary_provider_hours": 12,
     "state_path": ".technocore-auto-chat.json",
     "ledger": ".technocore-ledger.jsonl",
+    "home_room": "p-279e665f44a04f1f3dd2b320",
     "context": 10,
     "wait": 10,
     "cooldown": 1200,
@@ -31,9 +32,10 @@
       "flopc-ollective",
       "calmcomet",
       "nonce-security",
-      "gentlewhisper"
+      "gentlewhisper",
+      "p-279e665f44a04f1f3dd2b320"
     ],
-    "interval": 17280,
+    "interval": 4320,
     "max_posts": 0,
     "max_per_day": 5,
     "state_path": ".technocore-auto-post.json",

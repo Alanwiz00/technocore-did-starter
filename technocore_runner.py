@@ -94,6 +94,31 @@ def supervise(
             return
 
 
+HOME_ROOM_DISABLED = frozenset({"none", "off", "-", "0"})
+
+
+def resolve_home_room(config: dict, environ: object) -> str:
+    """The room every deployment of this tool should keep active, or "".
+
+    ``TECHNOCORE_HOME_ROOM`` wins over ``auto_chat.home_room`` in the JSON config;
+    set the env var to ``none`` to opt out of a room the shipped config names.
+    """
+    raw = (
+        environ.get("TECHNOCORE_HOME_ROOM", "")
+        or config.get("auto_chat", {}).get("home_room", "")
+        or ""
+    )
+    room = str(raw).strip()
+    if not room or room.lower() in HOME_ROOM_DISABLED:
+        return ""
+    return agent.validate_name(room)
+
+
+def home_state_path(chat_state: Path, home_room: str) -> Path:
+    """A cursor file for the home-room watcher that never collides with the main one."""
+    return Path(chat_state).expanduser().parent / f".technocore-home-{home_room}.json"
+
+
 def main() -> int:
     agent.configure_output_streams()
     try:
@@ -104,6 +129,17 @@ def main() -> int:
         post_args = parser.parse_args(["auto-post"])
         chat_args.send = send
         post_args.send = send
+        home_room = resolve_home_room(agent.load_config(), os.environ)
+        home_args = None
+        if home_room:
+            existing = list(post_args.rooms) if post_args.rooms else []
+            if home_room not in existing:
+                post_args.rooms = [*existing, home_room]
+            if home_room != chat_args.room:
+                home_args = parser.parse_args(["auto-chat"])
+                home_args.send = send
+                home_args.room = home_room
+                home_args.state = home_state_path(chat_args.state, home_room)
         private_key = agent.load_identity(chat_args.key)
     except (agent.IdentityError, agent.LocalFileError, agent.NetworkError,
             agent.ProtocolError) as error:
@@ -115,6 +151,19 @@ def main() -> int:
 
     mode = "LIVE signed posting" if send else "DRY RUN (nothing will be published)"
     print(f"starting Technocore automation: {mode}", file=sys.stderr, flush=True)
+    if home_room:
+        extra = "" if home_args is None else " + dedicated auto-chat"
+        print(
+            f"home room: {home_room} (in auto-post rotation{extra})",
+            file=sys.stderr,
+            flush=True,
+        )
+    plan = [("auto-chat", lambda: agent.run_auto_chat(private_key, chat_args))]
+    if home_args is not None:
+        plan.append(
+            (f"auto-chat:{home_room}", lambda: agent.run_auto_chat(private_key, home_args))
+        )
+    plan.append(("auto-post", lambda: agent.run_auto_post(private_key, post_args)))
     shutdown = threading.Event()
     outcomes: dict[str, str] = {}
     threads = [
@@ -124,10 +173,7 @@ def main() -> int:
             args=(name, operation, shutdown, outcomes),
             daemon=True,
         )
-        for name, operation in (
-            ("auto-chat", lambda: agent.run_auto_chat(private_key, chat_args)),
-            ("auto-post", lambda: agent.run_auto_post(private_key, post_args)),
-        )
+        for name, operation in plan
     ]
     for thread in threads:
         thread.start()

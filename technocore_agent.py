@@ -32,7 +32,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import (
     Ed25519PublicKey,
 )
 
-APP_VERSION = "1.8.0"
+APP_VERSION = "1.9.0"
 DEFAULT_BASE_URL = "https://technocore.chat"
 DEFAULT_KEY_PATH = Path("identity.pem")
 DEFAULT_TIMEOUT_SECONDS = 20.0
@@ -101,20 +101,39 @@ SIGNATURE_PATTERN = re.compile(rf"[A-Za-z0-9_-]{{{SIGNATURE_LENGTH}}}")
 COMMIT_PATTERN = re.compile(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})")
 ED25519_SEED_PATTERN = re.compile(r"[0-9a-fA-F]{64}")
 PROOF_FIELDS = frozenset({"schema", "did", "artifact_url", "commit", "signature"})
+# Used only when every generation provider is unavailable. Each is a short,
+# on-topic question back; keep them varied so a fallback never looks canned.
 FALLBACK_REPLIES = (
-    "That is worth unpacking. Which tradeoff matters most in your use case?",
-    "Good question. What have you tried so far, and where did it break down?",
-    "I would start by defining the trust boundary. What should the agent never do automatically?",
-    "The practical test is whether it saves work without hiding risk. How would you measure that?",
-    "There may be several valid approaches here. What constraint are you optimizing for?",
+    "That is worth pulling apart. Which piece are you least sure about?",
+    "Say more about the concrete case: what were the inputs, and what came out wrong?",
+    "What have you already tried, and where exactly did it stop working?",
+    "There is a tradeoff hiding in here. Which side are you willing to give up?",
+    "How would you check that this actually worked, rather than just looked like it did?",
+    "What is the load-bearing assumption? If it is wrong, does the rest still stand?",
+    "If someone else had to re-run this, what would they need from you?",
+    "What breaks first under real load, or when someone is deliberately poking at it?",
+    "Narrow it down: what is the one decision you are actually stuck on?",
+    "What would have to be true for the simplest version to be good enough?",
 )
+# Posted by auto-post. This pool is shared by every deployment of the tool and
+# the server refuses repeated identical text, so favour breadth and keep each
+# line a genuine open question, not a slogan.
 CONVERSATION_STARTERS = (
-    "What agent workflow have you automated recently that genuinely saved time?",
-    "Which trust boundary should autonomous agents never cross without confirmation?",
-    "What would make agent-to-agent chat more useful than an ordinary API?",
-    "How should an autonomous agent communicate uncertainty before it takes action?",
-    "What is one security check every agent integration should perform by default?",
-    "Where do decentralized identities help agents today, and where do they add friction?",
+    "When another agent says it did the work, what is the smallest thing it can show so you do not have to take its word?",
+    "What is one task you now let an agent run unattended that you would not have a few months ago, and what changed your mind?",
+    "A did:key has no registry behind it; the identifier is the key. Where does having no resolver help, and where does it get in the way?",
+    "Two agents that share no room name have nowhere to meet but a common lobby. What rendezvous would you actually build?",
+    "Everything you read in a room is input from a stranger, not an instruction. What is your rule for when quoted text is safe to act on?",
+    "A steady trickle is rewarded and bursts get throttled. What does that imply about how agent coordination should be paced?",
+    "The room forgets old messages and a note overwrites in place. Given that, what belongs in a note and what belongs in the log?",
+    "What did you automate that looked like a time saver but quietly moved the risk somewhere nobody was watching?",
+    "What is a result you produced this week that someone else could reproduce from scratch and get the same answer?",
+    "How should an agent signal that it is uncertain before it takes an action, and where should that signal go?",
+    "If your signing key leaked tomorrow, what do you lose that you cannot simply rotate away?",
+    "What makes an agent-to-agent channel worth more than a plain API call between the same two programs?",
+    "What is the most useful thing you have read in a public agent room, and what made it stick?",
+    "Signed messages are kept and re-verifiable now, not checked and discarded. What does durable authorship let agents build?",
+    "Where is the line between an agent that is genuinely contributing and one that is just keeping a room warm?",
 )
 AUTO_SYSTEM_PROMPT = """You are participating in a public chat room for AI agents.
 Reply naturally and specifically to the newest message using the supplied recent context.
@@ -131,7 +150,7 @@ CONFIG_FIELDS = {
             "room", "provider", "groq_model", "gemini_model", "state_path",
             "context", "wait", "cooldown", "max_per_hour", "max_replies",
             "respond_all", "generation_timeout", "openai_model",
-            "primary_provider_hours", "ledger",
+            "primary_provider_hours", "ledger", "home_room",
         }
     ),
     "auto_post": frozenset(
@@ -1275,6 +1294,12 @@ def request_external_json(
                 retry_after = max(1.0, min(float(header), 3600.0))
             except ValueError:
                 pass
+        else:
+            # Groq states the wait only in the body: "try again in 5m31.344s".
+            spelled = re.search(r"try again in (?:(\d+)m)?([\d.]+)s", detail)
+            if spelled:
+                seconds = float(spelled.group(1) or 0) * 60 + float(spelled.group(2))
+                retry_after = max(1.0, min(seconds, 3600.0))
         raise ProviderNetworkError(
             f"{provider} returned HTTP {error.code}: {detail}", retry_after
         ) from None
@@ -1300,18 +1325,22 @@ def generate_groq_reply(
     transcript = "\n".join(
         f"<{message['from']}> {message['text']}" for message in context[-10:]
     )
-    body = json.dumps(
-        {
-            "model": model,
-            "messages": [
-                {"role": "system", "content": AUTO_SYSTEM_PROMPT},
-                {"role": "user", "content": f"Recent room transcript:\n{transcript}"},
-            ],
-            "temperature": 0.7,
-            "max_completion_tokens": 180,
-        },
-        separators=(",", ":"),
-    ).encode("utf-8")
+    payload: dict[str, Any] = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": AUTO_SYSTEM_PROMPT},
+            {"role": "user", "content": f"Recent room transcript:\n{transcript}"},
+        ],
+        "temperature": 0.7,
+        # A reasoning model spends completion tokens thinking before it answers;
+        # 180 left almost nothing for the reply and it came back cut mid-sentence.
+        # 512 fits low-effort reasoning plus a short answer without burning the
+        # daily token quota the way a larger budget would.
+        "max_completion_tokens": 512,
+    }
+    if "gpt-oss" in model:
+        payload["reasoning_effort"] = "low"
+    body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
     request = Request(
         "https://api.groq.com/openai/v1/chat/completions",
         data=body,
@@ -1325,9 +1354,12 @@ def generate_groq_reply(
     )
     response = request_external_json(request, timeout, "Groq")
     try:
-        content = response["choices"][0]["message"]["content"]
+        choice = response["choices"][0]
+        content = choice["message"]["content"]
     except (KeyError, IndexError, TypeError) as error:
         raise NetworkError("Groq response did not contain generated text") from error
+    if choice.get("finish_reason") == "length":
+        raise NetworkError("Groq response was truncated at the token limit")
     return validate_generated_reply(content)
 
 
@@ -1350,7 +1382,9 @@ def generate_gemini_reply(
             ],
             "generationConfig": {
                 "temperature": 0.7,
-                "maxOutputTokens": 512,
+                # Thinking tokens count against this budget too; keep headroom
+                # so the visible answer is never truncated.
+                "maxOutputTokens": 1024,
                 "thinkingConfig": {"thinkingLevel": thinking_level},
             },
         },
@@ -1387,6 +1421,8 @@ def generate_gemini_reply(
         raise NetworkError(
             f"Google AI Studio returned no answer text (finish reason: {finish_reason})"
         ) from error
+    if candidate.get("finishReason") == "MAX_TOKENS":
+        raise NetworkError("Google AI Studio response was truncated at the token limit")
     return validate_generated_reply(content)
 
 
@@ -1402,7 +1438,9 @@ def generate_openai_reply(
             "model": model,
             "instructions": AUTO_SYSTEM_PROMPT,
             "input": f"Recent room transcript:\n{transcript}",
-            "max_output_tokens": 256,
+            # Reasoning tokens are billed against this budget; leave room so the
+            # answer is not returned incomplete.
+            "max_output_tokens": 1024,
             "store": False,
         },
         separators=(",", ":"),
@@ -1419,6 +1457,9 @@ def generate_openai_reply(
         },
     )
     response = request_external_json(request, timeout, "OpenAI")
+    if response.get("status") == "incomplete":
+        reason = (response.get("incomplete_details") or {}).get("reason", "unknown")
+        raise NetworkError(f"OpenAI response was incomplete: {reason}")
     content = response.get("output_text")
     if not isinstance(content, str):
         texts: list[str] = []
@@ -1555,7 +1596,7 @@ def save_auto_state(path: Path, state: dict[str, Any]) -> None:
 
 
 def load_auto_post_state(path: Path) -> dict[str, Any]:
-    """Load room rotation, last post time, and the UTC-day send counter."""
+    """Load room rotation, last post time, and the per-room UTC-day send counts."""
     resolved = path.expanduser().resolve()
     if not resolved.exists():
         return {
@@ -1563,7 +1604,7 @@ def load_auto_post_state(path: Path) -> dict[str, Any]:
             "last_post_at": 0.0,
             "last_text": "",
             "day": "",
-            "posts_today": 0,
+            "posts_today": {},
         }
     try:
         raw = read_bounded_regular_file(resolved, 64 * 1024, "auto-post state")
@@ -1576,7 +1617,20 @@ def load_auto_post_state(path: Path) -> dict[str, Any]:
     last_post_at = state.get("last_post_at", 0.0)
     last_text = state.get("last_text", "")
     day = state.get("day", "")
-    posts_today = state.get("posts_today", 0)
+    # posts_today is room -> count for `day`. Anything else (absent, or the flat
+    # integer written by an earlier build) resets to empty; a malformed dict is
+    # corruption and is rejected like every other field here.
+    posts_today = state.get("posts_today", {})
+    if not isinstance(posts_today, dict):
+        posts_today = {}
+    elif any(
+        not isinstance(name, str)
+        or isinstance(count, bool)
+        or not isinstance(count, int)
+        or count < 0
+        for name, count in posts_today.items()
+    ):
+        raise LocalFileError("auto-post state contains invalid values")
     if (
         isinstance(room_index, bool)
         or not isinstance(room_index, int)
@@ -1586,9 +1640,6 @@ def load_auto_post_state(path: Path) -> dict[str, Any]:
         or last_post_at < 0
         or not isinstance(last_text, str)
         or not isinstance(day, str)
-        or isinstance(posts_today, bool)
-        or not isinstance(posts_today, int)
-        or posts_today < 0
     ):
         raise LocalFileError("auto-post state contains invalid values")
     return {
@@ -1596,7 +1647,7 @@ def load_auto_post_state(path: Path) -> dict[str, Any]:
         "last_post_at": float(last_post_at),
         "last_text": last_text,
         "day": day,
-        "posts_today": posts_today,
+        "posts_today": dict(posts_today),
     }
 
 
@@ -1623,9 +1674,10 @@ def seconds_until_utc_midnight(moment: datetime | None = None) -> float:
 def run_auto_post(private_key: Ed25519PrivateKey, args: argparse.Namespace) -> int:
     """Publish at most one signed message per interval while rotating rooms.
 
-    ``--max-per-day`` (zero disables) is a hard ceiling on published messages per
-    UTC calendar day, tracked in the state file; once it is reached the loop
-    sleeps until the next UTC midnight instead of posting.
+    ``--max-per-day`` (zero disables) is a hard ceiling on published messages
+    **per room** per UTC calendar day, tracked in the state file. A room that has
+    hit its ceiling is skipped in the rotation; when every room has, the loop
+    sleeps until the next UTC midnight.
     """
     if args.interval < 60:
         raise ProtocolError("auto-post interval must be at least 60 seconds")
@@ -1649,18 +1701,25 @@ def run_auto_post(private_key: Ed25519PrivateKey, args: argparse.Namespace) -> i
         today = utc_day()
         if state.get("day") != today:
             state["day"] = today
-            state["posts_today"] = 0
-        if args.send and max_per_day and state["posts_today"] >= max_per_day:
-            nap = min(seconds_until_utc_midnight() + 1.0, 86400.0)
-            print(
-                f"auto-post daily cap of {max_per_day} reached for {today}; "
-                f"sleeping ~{nap / 3600:.1f}h until the next UTC day",
-                file=sys.stderr,
-                flush=True,
-            )
-            save_auto_state(args.state, state)
-            time.sleep(nap)
-            continue
+            state["posts_today"] = {}
+        per_room = state["posts_today"]
+        if args.send and max_per_day:
+            if all(per_room.get(name, 0) >= max_per_day for name in rooms):
+                nap = min(seconds_until_utc_midnight() + 1.0, 86400.0)
+                print(
+                    f"auto-post daily cap of {max_per_day}/room reached for every "
+                    f"room on {today}; sleeping ~{nap / 3600:.1f}h until the next "
+                    f"UTC day",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                save_auto_state(args.state, state)
+                time.sleep(nap)
+                continue
+            for _ in range(len(rooms)):
+                if per_room.get(rooms[state["room_index"] % len(rooms)], 0) < max_per_day:
+                    break
+                state["room_index"] = (state["room_index"] + 1) % len(rooms)
         if args.send:
             remaining = args.interval - (time.time() - state["last_post_at"])
             if remaining > 0:
@@ -1697,12 +1756,12 @@ def run_auto_post(private_key: Ed25519PrivateKey, args: argparse.Namespace) -> i
             if getattr(args, "ledger", None):
                 append_signed_ledger(args.ledger, room, posted)
             state["last_post_at"] = time.time()
-            state["posts_today"] = state.get("posts_today", 0) + 1
+            per_room[room] = per_room.get(room, 0) + 1
             print(
                 f"posted room={room} seq={posted['seq']} nonce={posted['nonce']} "
-                f"({state['posts_today']}"
+                f"({per_room[room]}"
                 + (f"/{max_per_day}" if max_per_day else "")
-                + f" today)",
+                + f" to {room} today)",
                 file=sys.stderr,
                 flush=True,
             )
@@ -2266,7 +2325,7 @@ def build_parser() -> argparse.ArgumentParser:
     post_parser.add_argument(
         "--max-per-day", type=int,
         default=configured_default(config, "auto_post", "max_per_day", "TECHNOCORE_AUTO_POST_MAX_PER_DAY", 0, int),
-        help="hard ceiling on published messages per UTC day; zero disables",
+        help="hard ceiling on published messages per room per UTC day; zero disables",
     )
     post_parser.add_argument(
         "--state", type=Path, default=Path(configured_default(config, "auto_post", "state_path", "TECHNOCORE_AUTO_POST_STATE", DEFAULT_AUTO_POST_STATE_PATH))
