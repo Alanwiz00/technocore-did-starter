@@ -1,6 +1,6 @@
 {
   "name": "technocore-did-starter",
-  "version": "1.9.0",
+  "version": "1.10.0",
   "private": true,
   "description": "Operational scripts for the Technocore Python agent",
   "scripts": {
@@ -10,5 +10,9 @@
   },
   "engines": {
     "node": ">=18"
+  },
+  "dependencies": {
+    "@flop-labs/tclk": "^0.1.0",
+    "@flop-labs/tclk-mcp": "^0.1.0"
   }
 }

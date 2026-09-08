@@ -1025,6 +1025,79 @@ class RunnerSupervisorTests(unittest.TestCase):
             self.assertTrue(home.name.startswith(".technocore-"))
             self.assertIn("p-279e665f44a04f1f3dd2b320", home.name)
 
+    def test_deal_loop_plan_is_off_unless_an_interval_is_set(self):
+        self.assertIsNone(runner.deal_loop_plan({}))
+        self.assertEqual(
+            runner.deal_loop_plan({"TECHNOCORE_DEAL_INTERVAL": "21600"}),
+            (21600.0, "tclk-offers"),
+        )
+        self.assertEqual(
+            runner.deal_loop_plan(
+                {"TECHNOCORE_DEAL_INTERVAL": "600", "TECHNOCORE_DEAL_ROOM": "d-deals"}
+            ),
+            (600.0, "d-deals"),
+        )
+        with self.assertRaises(agent.ProtocolError):
+            runner.deal_loop_plan({"TECHNOCORE_DEAL_INTERVAL": "30"})
+        with self.assertRaises(agent.ProtocolError):
+            runner.deal_loop_plan({"TECHNOCORE_DEAL_INTERVAL": "soon"})
+
+    def _staged_deal_script(self, directory):
+        script = Path(directory) / "deal.mjs"
+        script.write_text("// stub\n")
+        (script.parent / "node_modules" / "@flop-labs" / "tclk").mkdir(parents=True)
+        return script
+
+    def test_run_deal_loop_needs_its_prerequisites(self):
+        with tempfile.TemporaryDirectory() as directory:
+            script = self._staged_deal_script(directory)
+            with patch.object(runner, "DEAL_SCRIPT", script), patch.object(
+                runner.shutil, "which", return_value=None
+            ):
+                with self.assertRaisesRegex(agent.ProtocolError, "node is not on PATH"):
+                    runner.run_deal_loop(600.0, "tclk-offers")
+            with patch.object(
+                runner, "DEAL_SCRIPT", Path(directory) / "missing.mjs"
+            ), patch.object(runner.shutil, "which", return_value="/usr/bin/node"):
+                with self.assertRaisesRegex(agent.ProtocolError, "missing"):
+                    runner.run_deal_loop(600.0, "tclk-offers")
+
+    def test_run_deal_loop_runs_the_script_then_waits(self):
+        with tempfile.TemporaryDirectory() as directory:
+            script = self._staged_deal_script(directory)
+            result = SimpleNamespace(returncode=0, stdout="  recorded  -> ok\n", stderr="")
+            with patch.object(runner, "DEAL_SCRIPT", script), patch.object(
+                runner.shutil, "which", return_value="/usr/bin/node"
+            ), patch.object(
+                runner.subprocess, "run", return_value=result
+            ) as run, patch.object(
+                runner.time, "sleep", side_effect=KeyboardInterrupt
+            ), patch("sys.stderr", new=io.StringIO()) as err:
+                with self.assertRaises(KeyboardInterrupt):
+                    runner.run_deal_loop(600.0, "tclk-offers")
+            argv = run.call_args.args[0]
+            self.assertEqual(argv[1:], [str(script), "tclk-offers"])
+            self.assertEqual(run.call_args.kwargs["cwd"], str(script.parent))
+            self.assertIn("tclk deal in tclk-offers", err.getvalue())
+
+    def test_run_deal_loop_keeps_going_after_a_failed_deal(self):
+        with tempfile.TemporaryDirectory() as directory:
+            script = self._staged_deal_script(directory)
+            result = SimpleNamespace(
+                returncode=1, stdout="", stderr="deal failed: lock: 503 Service Unavailable\n"
+            )
+            with patch.object(runner, "DEAL_SCRIPT", script), patch.object(
+                runner.shutil, "which", return_value="/usr/bin/node"
+            ), patch.object(
+                runner.subprocess, "run", return_value=result
+            ), patch.object(
+                runner.time, "sleep", side_effect=[None, KeyboardInterrupt]
+            ), patch("sys.stderr", new=io.StringIO()) as err:
+                with self.assertRaises(KeyboardInterrupt):
+                    runner.run_deal_loop(600.0, "tclk-offers")
+            self.assertIn("failed", err.getvalue())
+            self.assertIn("503", err.getvalue())
+
 
 class RetainedSignatureTests(unittest.TestCase):
     def setUp(self):

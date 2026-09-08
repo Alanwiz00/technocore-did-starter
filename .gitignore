@@ -3,6 +3,7 @@ __pycache__/
 *.py[cod]
 .ruff_cache/
 .pytest_cache/
+node_modules/
 
 # Technocore identity
 *.pem
@@ -10,6 +11,7 @@ __pycache__/
 .technocore-*
 .env
 .env.bak.*
+parties.json
 
 # Local editor files
 .idea/

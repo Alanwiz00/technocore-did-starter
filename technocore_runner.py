@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -21,6 +23,10 @@ FATAL_WORKER_ERRORS = (agent.IdentityError, agent.ProtocolError)
 WORKER_RESTART_BASE_SECONDS = 5.0
 WORKER_RESTART_CAP_SECONDS = 300.0
 WORKER_HEALTHY_SECONDS = 300.0
+
+DEAL_SCRIPT = Path(__file__).resolve().parent / "deal.mjs"
+DEAL_MIN_INTERVAL_SECONDS = 300.0
+DEAL_SUBPROCESS_TIMEOUT_SECONDS = 240.0
 
 
 def load_env_file(path: Path = Path(".env")) -> None:
@@ -119,6 +125,89 @@ def home_state_path(chat_state: Path, home_room: str) -> Path:
     return Path(chat_state).expanduser().parent / f".technocore-home-{home_room}.json"
 
 
+def deal_loop_plan(environ: object) -> tuple[float, str] | None:
+    """(interval_seconds, room) when a scheduled tclk deal loop is configured.
+
+    Off unless ``TECHNOCORE_DEAL_INTERVAL`` is set. The room defaults to the
+    shared ``tclk-offers`` venue, where deals belong and anyone can audit them.
+    """
+    raw = str(environ.get("TECHNOCORE_DEAL_INTERVAL", "")).strip()
+    if not raw:
+        return None
+    try:
+        interval = float(raw)
+    except ValueError as error:
+        raise agent.ProtocolError(
+            "TECHNOCORE_DEAL_INTERVAL must be a number of seconds"
+        ) from error
+    if interval < DEAL_MIN_INTERVAL_SECONDS:
+        raise agent.ProtocolError(
+            f"TECHNOCORE_DEAL_INTERVAL must be at least "
+            f"{DEAL_MIN_INTERVAL_SECONDS:.0f} seconds"
+        )
+    room = str(environ.get("TECHNOCORE_DEAL_ROOM", "")).strip() or "tclk-offers"
+    return interval, agent.validate_name(room)
+
+
+def run_deal_loop(interval: float, room: str) -> int:
+    """Run one tclk PaperRail deal rehearsal per interval, forever.
+
+    Each rehearsal is a full offer/accept/lock/reveal/receipt choreography by the
+    disposable pair in ``parties.json``, self-audited and appended to
+    ``.technocore-deals.jsonl``. A missing prerequisite (node, the script, the
+    package) is fatal; a failed rehearsal is transient — logged, retried next
+    tick.
+    """
+    node = shutil.which("node")
+    if node is None:
+        raise agent.ProtocolError("node is not on PATH; cannot run the tclk deal loop")
+    if not DEAL_SCRIPT.exists():
+        raise agent.ProtocolError(f"{DEAL_SCRIPT.name} is missing")
+    if not (DEAL_SCRIPT.parent / "node_modules" / "@flop-labs" / "tclk").is_dir():
+        raise agent.ProtocolError(
+            "@flop-labs/tclk is not installed; run `npm install` in the project"
+        )
+    while True:
+        started = time.monotonic()
+        try:
+            done = subprocess.run(
+                [node, str(DEAL_SCRIPT), room],
+                cwd=str(DEAL_SCRIPT.parent),
+                capture_output=True,
+                text=True,
+                timeout=DEAL_SUBPROCESS_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired:
+            print(
+                f"warning: tclk deal in {room} timed out after "
+                f"{DEAL_SUBPROCESS_TIMEOUT_SECONDS:.0f}s; retrying next tick",
+                file=sys.stderr,
+                flush=True,
+            )
+        else:
+            if done.returncode == 0:
+                tail = [ln for ln in (done.stdout or "").splitlines() if ln.strip()]
+                print(
+                    f"tclk deal in {room}: {tail[-1].strip() if tail else 'ok'}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            else:
+                why = [
+                    ln for ln in (done.stderr or done.stdout or "").splitlines()
+                    if ln.strip()
+                ]
+                print(
+                    f"warning: tclk deal in {room} failed "
+                    f"({why[-1].strip() if why else done.returncode}); retrying next tick",
+                    file=sys.stderr,
+                    flush=True,
+                )
+        elapsed = time.monotonic() - started
+        if elapsed < interval:
+            time.sleep(interval - elapsed)
+
+
 def main() -> int:
     agent.configure_output_streams()
     try:
@@ -140,6 +229,7 @@ def main() -> int:
                 home_args.send = send
                 home_args.room = home_room
                 home_args.state = home_state_path(chat_args.state, home_room)
+        deal_plan = deal_loop_plan(os.environ)
         private_key = agent.load_identity(chat_args.key)
     except (agent.IdentityError, agent.LocalFileError, agent.NetworkError,
             agent.ProtocolError) as error:
@@ -164,6 +254,17 @@ def main() -> int:
             (f"auto-chat:{home_room}", lambda: agent.run_auto_chat(private_key, home_args))
         )
     plan.append(("auto-post", lambda: agent.run_auto_post(private_key, post_args)))
+    if deal_plan is not None:
+        deal_interval, deal_room = deal_plan
+        plan.append(
+            (f"tclk-deals:{deal_room}", lambda: run_deal_loop(deal_interval, deal_room))
+        )
+        print(
+            f"tclk deal loop: one PaperRail rehearsal in {deal_room} every "
+            f"{deal_interval / 3600:.1f}h (disposable keys from parties.json)",
+            file=sys.stderr,
+            flush=True,
+        )
     shutdown = threading.Event()
     outcomes: dict[str, str] = {}
     threads = [

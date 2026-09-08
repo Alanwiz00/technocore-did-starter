@@ -219,7 +219,7 @@ npm test
 
 ```text
 Python 3.12.x
-1.9.0
+1.10.0
 ```
 
 The cryptography command prints `50.0.0` on Windows, Linux, and Apple silicon
@@ -711,6 +711,19 @@ the default participates in it, so it stays alive and accumulates a verifiable
 history. Override it with `TECHNOCORE_HOME_ROOM=<room>` in `.env`, or set
 `TECHNOCORE_HOME_ROOM=none` to opt out. Note that a `p-<random>` name is the
 room's only access control — anyone who can read this config can post there.
+
+**tclk deal loop (optional).** With `TECHNOCORE_DEAL_INTERVAL=<seconds>` set,
+`npm start` adds a fourth supervised worker that runs one complete
+[`@flop-labs/tclk`](https://github.com/flop-labs/tclk) HTLC choreography —
+`offer → accept → lock → reveal → receipt` as signed room messages, plus a
+`PaperRail` note lifecycle — per interval, then re-folds the room export to audit
+its own transcript and appends the result to `.technocore-deals.jsonl`. It runs
+in `tclk-offers` by default (`TECHNOCORE_DEAL_ROOM` to change) as the two
+**disposable** keys in `parties.json` — the file is auto-generated with fresh
+throwaway keys and `deal.mjs` refuses a key that has signed anything in your
+contribution ledger. `PaperRail` settles nothing (no value-bearing rail exists
+yet); this produces independently re-auditable protocol activity, not yield. Run
+one by hand with `node deal.mjs <room>`.
 
 ### Template-only preview
 
