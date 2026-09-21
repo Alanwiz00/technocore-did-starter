@@ -18,3 +18,4 @@ parties.json
 .vscode/
 .DS_Store
 Thumbs.db
+*.tmp

@@ -13,6 +13,7 @@ import time
 from pathlib import Path
 from typing import Callable
 
+import airdrop_watch
 import technocore_agent as agent
 
 
@@ -149,6 +150,25 @@ def deal_loop_plan(environ: object) -> tuple[float, str] | None:
     return interval, agent.validate_name(room)
 
 
+def watch_loop_interval(environ: object) -> float | None:
+    """Seconds between passes of the read-only airdrop watcher, or None when off."""
+    raw = str(environ.get("TECHNOCORE_WATCH_INTERVAL", "")).strip()
+    if not raw:
+        return None
+    try:
+        interval = float(raw)
+    except ValueError as error:
+        raise agent.ProtocolError(
+            "TECHNOCORE_WATCH_INTERVAL must be a number of seconds"
+        ) from error
+    if interval < airdrop_watch.MIN_INTERVAL_SECONDS:
+        raise agent.ProtocolError(
+            f"TECHNOCORE_WATCH_INTERVAL must be at least "
+            f"{airdrop_watch.MIN_INTERVAL_SECONDS:.0f} seconds"
+        )
+    return interval
+
+
 def run_deal_loop(interval: float, room: str) -> int:
     """Run one tclk PaperRail deal rehearsal per interval, forever.
 
@@ -230,6 +250,7 @@ def main() -> int:
                 home_args.room = home_room
                 home_args.state = home_state_path(chat_args.state, home_room)
         deal_plan = deal_loop_plan(os.environ)
+        watch_interval = watch_loop_interval(os.environ)
         private_key = agent.load_identity(chat_args.key)
     except (agent.IdentityError, agent.LocalFileError, agent.NetworkError,
             agent.ProtocolError) as error:
@@ -262,6 +283,14 @@ def main() -> int:
         print(
             f"tclk deal loop: one PaperRail rehearsal in {deal_room} every "
             f"{deal_interval / 3600:.1f}h (disposable keys from parties.json)",
+            file=sys.stderr,
+            flush=True,
+        )
+    if watch_interval is not None:
+        plan.append(("airdrop-watch", lambda: airdrop_watch.run_watch_loop(watch_interval)))
+        print(
+            f"airdrop watch: read-only check of official FLOP/Technocore sources "
+            f"every {watch_interval / 60:.0f} min (alerts appear here as [watch])",
             file=sys.stderr,
             flush=True,
         )

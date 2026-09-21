@@ -219,7 +219,7 @@ npm test
 
 ```text
 Python 3.12.x
-1.10.0
+1.11.0
 ```
 
 The cryptography command prints `50.0.0` on Windows, Linux, and Apple silicon
@@ -711,6 +711,18 @@ the default participates in it, so it stays alive and accumulates a verifiable
 history. Override it with `TECHNOCORE_HOME_ROOM=<room>` in `.env`, or set
 `TECHNOCORE_HOME_ROOM=none` to opt out. Note that a `p-<random>` name is the
 room's only access control — anyone who can read this config can post there.
+
+**Airdrop watch (optional, read-only).** With `TECHNOCORE_WATCH_INTERVAL=<seconds>`
+set, `npm start` runs `airdrop_watch.py`, which checks the official sources —
+the `flop-labs` GitHub org (repos, `technocore-chat` releases, `yellowpaper`,
+`tclk` and the sonnet challenge), the live `technocore.chat` protocol documents
+and `flop.finance` — against their last snapshot and prints `[watch]` alerts for
+anything that changed. New text mentioning a faucet, testnet, airdrop, snapshot or
+claim is flagged `PRIORITY` (and raises a desktop notification where
+`notify-send` exists). The first pass only records a baseline; events append to
+`.technocore-watch-events.jsonl`. It never writes to those services. Run one pass
+by hand with `python airdrop_watch.py --once`. `@flop_labs` on X can't be read
+without an account, so follow it directly as well.
 
 **tclk deal loop (optional).** With `TECHNOCORE_DEAL_INTERVAL=<seconds>` set,
 `npm start` adds a fourth supervised worker that runs one complete

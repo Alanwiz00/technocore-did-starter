@@ -32,7 +32,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import (
     Ed25519PublicKey,
 )
 
-APP_VERSION = "1.10.0"
+APP_VERSION = "1.11.0"
 DEFAULT_BASE_URL = "https://technocore.chat"
 DEFAULT_KEY_PATH = Path("identity.pem")
 DEFAULT_TIMEOUT_SECONDS = 20.0
@@ -1573,7 +1573,9 @@ def save_auto_state(path: Path, state: dict[str, Any]) -> None:
     """Atomically persist the auto-chat cursor without exposing key material."""
     resolved = path.expanduser().resolve()
     resolved.parent.mkdir(parents=True, exist_ok=True)
-    temporary = resolved.with_name(f".{resolved.name}.{os.getpid()}.tmp")
+    # "<name>.<pid>.tmp", not ".<name>...": the state files already start with a
+    # dot, and a doubled dot slips past the ".technocore-*" ignore rule.
+    temporary = resolved.with_name(f"{resolved.name}.{os.getpid()}.tmp")
     data = (json.dumps(state, separators=(",", ":")) + "\n").encode("utf-8")
     descriptor: int | None = None
     try:

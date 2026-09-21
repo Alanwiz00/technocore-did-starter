@@ -15,6 +15,7 @@ from urllib.request import Request
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
+import airdrop_watch as watch
 import technocore_agent as agent
 import technocore_runner as runner
 
@@ -1266,6 +1267,138 @@ class RetainedSignatureTests(unittest.TestCase):
             entry = json.loads(ledger.read_text().splitlines()[0])
             self.assertEqual(entry["seq"], 5)
             self.assertEqual(entry["schema"], agent.LEDGER_SCHEMA)
+
+
+class AirdropWatchTests(unittest.TestCase):
+    def _source(self, kind="text", name="doc"):
+        return watch.Source(name, f"https://example.test/{name}", kind)
+
+    def test_first_pass_is_a_silent_baseline_then_changes_are_reported(self):
+        source = self._source()
+        state = {}
+        pages = {"v": "alpha\nbeta"}
+        fetch = lambda url: pages["v"]
+        self.assertIsNone(watch.check_source(source, state, fetch))  # baseline
+        self.assertIsNone(watch.check_source(source, state, fetch))  # unchanged
+        pages["v"] = "alpha\nbeta\nFaucet opens for testnet claims"
+        event = watch.check_source(source, state, fetch)
+        self.assertEqual(event["added"], ["Faucet opens for testnet claims"])
+        self.assertTrue(event["priority"])
+        self.assertEqual(event["keywords"], ["claim", "faucet", "testnet"])
+
+    def test_ordinary_changes_are_not_priority(self):
+        source = self._source()
+        state = {}
+        pages = {"v": "one\ntwo"}
+        fetch = lambda url: pages["v"]
+        watch.check_source(source, state, fetch)
+        pages["v"] = "one\ntwo\nfixed a typo in the health check"
+        event = watch.check_source(source, state, fetch)
+        self.assertFalse(event["priority"])
+        self.assertEqual(event["removed"], [])
+
+    def test_failures_never_wipe_the_snapshot_and_warn_once(self):
+        source = self._source()
+        state = {}
+        watch.check_source(source, state, lambda url: "kept\nlines")
+
+        def boom(url):
+            raise OSError("network down")
+
+        with patch("sys.stderr", new=io.StringIO()) as err:
+            for _ in range(5):
+                self.assertIsNone(watch.check_source(source, state, boom))
+        self.assertEqual(state["doc"]["lines"], ["kept", "lines"])
+        self.assertEqual(err.getvalue().count("failed 3 times"), 1)
+        self.assertIsNone(watch.check_source(source, state, lambda url: "kept\nlines"))
+        self.assertEqual(state["doc"]["fails"], 0)
+
+    def test_empty_and_error_responses_are_failures_not_changes(self):
+        state = {}
+        source = self._source(kind="repos", name="repos")
+        watch.check_source(source, state, lambda url: json.dumps([{"name": "a"}]))
+        with patch("sys.stderr", new=io.StringIO()):
+            for body in ("", json.dumps({"message": "API rate limit exceeded"}), "[]"):
+                self.assertIsNone(watch.check_source(source, state, lambda url, b=body: b))
+        self.assertEqual(state["repos"]["lines"], ["repo a"])
+
+    def test_normalisers_produce_stable_comparable_lines(self):
+        repos = json.dumps([{"name": "b"}, {"name": "a"}])
+        self.assertEqual(watch.normalise("repos", repos), ["repo a", "repo b"])
+        releases = json.dumps([{"tag_name": "v1", "published_at": "2026-09-07T00:00:00Z",
+                                "name": "One", "body": "### Added\n\n- faucet"}])
+        self.assertEqual(
+            watch.normalise("releases", releases),
+            ["release v1 2026-09-07 One", "  ### Added", "  - faucet"],
+        )
+        commits = json.dumps([{"sha": "abcdef123456",
+                               "commit": {"author": {"date": "2026-09-11T00:00:00Z"},
+                                          "message": "Launch record\n\nbody"}}])
+        self.assertEqual(watch.normalise("commits", commits), ["abcdef1 2026-09-11 Launch record"])
+        html = "<html><style>x{}</style><script>var n=1</script><p>Hello world.</p><p>Second one!</p></html>"
+        self.assertEqual(watch.normalise("html", html), ["Hello world.", "Second one!"])
+
+    def test_run_once_records_a_baseline_then_appends_priority_events(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = Path(directory) / "watch.json"
+            events_path = Path(directory) / "events.jsonl"
+            source = self._source()
+            pages = {"v": "old text"}
+            fetch = lambda url: pages["v"]
+            with patch("sys.stderr", new=io.StringIO()) as err:
+                self.assertEqual(
+                    watch.run_once(state_path, events_path, fetch=fetch, sources=(source,)), []
+                )
+                self.assertIn("baseline recorded for 1/1", err.getvalue())
+                pages["v"] = "old text\nTestnet snapshot announced"
+                events = watch.run_once(state_path, events_path, fetch=fetch, sources=(source,))
+            self.assertEqual(len(events), 1)
+            self.assertIn("PRIORITY", err.getvalue())
+            logged = json.loads(events_path.read_text().splitlines()[0])
+            self.assertEqual(logged["source"], "doc")
+            self.assertTrue(logged["priority"])
+            self.assertEqual(oct(state_path.stat().st_mode & 0o777), "0o600")
+
+    def test_fetch_refuses_non_https_and_only_sends_the_token_to_github(self):
+        with self.assertRaises(ValueError):
+            watch.fetch_text("http://example.test/")
+        seen = {}
+
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def read(self, size):
+                return b"ok"
+
+        def fake_urlopen(request, timeout):
+            seen[request.full_url] = request.get_header("Authorization")
+            return Response()
+
+        with patch.object(watch, "urlopen", side_effect=fake_urlopen):
+            watch.fetch_text("https://api.github.com/x", token="t0k")
+            watch.fetch_text("https://technocore.chat/llms.txt", token="t0k")
+        self.assertEqual(seen["https://api.github.com/x"], "Bearer t0k")
+        self.assertIsNone(seen["https://technocore.chat/llms.txt"])
+
+    def test_runner_reads_the_watch_interval(self):
+        self.assertIsNone(runner.watch_loop_interval({}))
+        self.assertEqual(runner.watch_loop_interval({"TECHNOCORE_WATCH_INTERVAL": "1800"}), 1800.0)
+        with self.assertRaises(agent.ProtocolError):
+            runner.watch_loop_interval({"TECHNOCORE_WATCH_INTERVAL": "60"})
+        with self.assertRaises(agent.ProtocolError):
+            runner.watch_loop_interval({"TECHNOCORE_WATCH_INTERVAL": "often"})
+
+    def test_a_failed_state_save_leaves_no_temp_file_behind(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / ".technocore-auto-chat.json"
+            with patch.object(agent.os, "replace", side_effect=OSError("boom")):
+                with self.assertRaises(agent.LocalFileError):
+                    agent.save_auto_state(path, {"last_seq": 1, "sent_at": []})
+            self.assertEqual(list(Path(directory).iterdir()), [])
 
 
 class ConfigurationTests(unittest.TestCase):
