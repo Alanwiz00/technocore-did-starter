@@ -1475,7 +1475,8 @@ class AirdropWatchTests(unittest.TestCase):
             logged = json.loads(events_path.read_text().splitlines()[0])
             self.assertEqual(logged["source"], "doc")
             self.assertTrue(logged["priority"])
-            self.assertEqual(oct(state_path.stat().st_mode & 0o777), "0o600")
+            if os.name != "nt":
+                self.assertEqual(state_path.stat().st_mode & 0o777, 0o600)
 
     def test_fetch_refuses_non_https_and_only_sends_the_token_to_github(self):
         with self.assertRaises(ValueError):

@@ -49,7 +49,8 @@
       "Bash(python3 -I -c \"import json,sys;r=json.loads\\(sys.stdin.read\\(\\)\\);print\\({k:r.get\\(k\\) for k in \\('ts','outcome','final_status','rail_status','secret_opens_statement','other_contracts_in_room'\\)}, [f['type']+'/'+f['sig'] for f in r['frames']]\\)\")",
       "Bash(systemctl --user show technocore -p MainPID --value)",
       "Bash(timeout 20 /usr/bin/python3 technocore_runner.py)",
-      "Bash(python3 -I -c ' *)"
+      "Bash(python3 -I -c ' *)",
+      "Bash(python3 -m unittest discover -s tests)"
     ]
   }
 }
