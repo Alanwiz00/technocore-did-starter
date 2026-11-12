@@ -1,0 +1,39 @@
+# systemd user unit for the Technocore runner (auto-post, auto-chat, tclk deal loop,
+# airdrop watch). Starts at login, restarts on crash, logs to the journal.
+#
+# Install:   cp scripts/technocore.service ~/.config/systemd/user/
+#            systemctl --user daemon-reload && systemctl --user enable --now technocore
+# Logs:      journalctl --user -u technocore -f
+# Stop:      systemctl --user stop technocore     (disable: systemctl --user disable technocore)
+#
+# Needs the identity passphrase in the login keyring (see README "Run as a service"):
+#   secret-tool store --label='Technocore identity passphrase' service technocore key identity.pem
+# WorkingDirectory assumes the checkout lives at ~/repo/technocore-did-starter.
+
+[Unit]
+Description=Technocore automation (auto-post, auto-chat, deal loop, airdrop watch)
+Documentation=file://%h/repo/technocore-did-starter/README.md
+# A misconfiguration (bad passphrase, missing identity) exits 1 every time; stop
+# retrying after 5 failed starts in an hour instead of spinning.
+StartLimitIntervalSec=1h
+StartLimitBurst=5
+
+[Service]
+Type=simple
+WorkingDirectory=%h/repo/technocore-did-starter
+Environment=PYTHONUNBUFFERED=1
+# No terminal to prompt on: read the identity passphrase from the login keyring.
+Environment=TECHNOCORE_IDENTITY_KEYRING=1
+# node is nvm-managed (deal loop). Sourcing nvm.sh resolves the `default` alias, so a
+# node upgrade doesn't break a hard-coded PATH. Python is the system 3.12 npm start uses.
+ExecStart=/bin/bash -c '. %h/.nvm/nvm.sh >/dev/null 2>&1; exec /usr/bin/python3 technocore_runner.py'
+# The runner shuts down cleanly on Ctrl-C (KeyboardInterrupt → exit 130), not SIGTERM.
+KillSignal=SIGINT
+SuccessExitStatus=130
+TimeoutStopSec=20
+Restart=on-failure
+# Also covers a login race where the keyring is not unlocked yet on the first try.
+RestartSec=60
+
+[Install]
+WantedBy=default.target

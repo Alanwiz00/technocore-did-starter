@@ -7,6 +7,7 @@ import tempfile
 import threading
 import unittest
 from contextlib import redirect_stdout
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -348,6 +349,60 @@ class NetworkTests(unittest.TestCase):
         self.assertEqual(sent[0]["nonce"], sent[1]["nonce"])
         self.assertEqual(sent[0]["nonce"], "7")
         self.assertEqual(response["posted"]["seq"], 4)
+
+    def test_write_408_upload_deadline_is_retryable(self):
+        error = HTTPError(
+            "https://technocore.chat/r/chat",
+            408,
+            "Request Timeout",
+            {},
+            io.BytesIO(b"request body not received within 10 s; retry on a new connection"),
+        )
+        with patch.object(agent.HTTP_OPENER, "open", side_effect=error):
+            with self.assertRaisesRegex(
+                agent.RetryableNetworkError, "HTTP 408.*within 10 s"
+            ):
+                agent.request_json(
+                    Request("https://technocore.chat/r/chat"), 1, is_write=True
+                )
+
+    def test_post_resends_the_same_signed_body_after_a_408(self):
+        key = Ed25519PrivateKey.generate()
+        bodies = []
+
+        def fake_open(request, timeout):
+            bodies.append(request.data)
+            if len(bodies) == 1:
+                raise HTTPError(
+                    request.full_url, 408, "Request Timeout", {},
+                    io.BytesIO(b"request body not received in time"),
+                )
+            payload = json.loads(request.data.decode("utf-8"))
+            record = {
+                "seq": 9,
+                "from": payload["did"],
+                "text": payload["text"],
+                "nonce": payload["nonce"],
+            }
+            body = json.dumps(
+                {"room": "chat", "count": 1, "last_seq": 9,
+                 "messages": [record], "posted": record}
+            ).encode("utf-8")
+            response = MagicMock()
+            response.__enter__.return_value.read.return_value = body
+            return response
+
+        with patch.object(
+            agent.HTTP_OPENER, "open", side_effect=fake_open
+        ), patch.object(agent.time, "sleep"), patch.object(
+            agent.random, "uniform", return_value=1.0
+        ), patch("sys.stderr", new=io.StringIO()) as stderr:
+            response = agent.post_signed_message(key, "chat", "hello world", nonce=7)
+
+        self.assertEqual(len(bodies), 2)
+        self.assertEqual(bodies[0], bodies[1])  # same nonce, same signature
+        self.assertEqual(response["posted"]["seq"], 9)
+        self.assertIn("HTTP 408", stderr.getvalue())
 
     def test_post_stops_after_the_transport_retry_budget(self):
         key = Ed25519PrivateKey.generate()
@@ -1046,6 +1101,7 @@ class RunnerSupervisorTests(unittest.TestCase):
     def _staged_deal_script(self, directory):
         script = Path(directory) / "deal.mjs"
         script.write_text("// stub\n")
+        (script.parent / "tclk-signing.mjs").write_text("// stub\n")
         (script.parent / "node_modules" / "@flop-labs" / "tclk").mkdir(parents=True)
         return script
 
@@ -1098,6 +1154,68 @@ class RunnerSupervisorTests(unittest.TestCase):
                     runner.run_deal_loop(600.0, "tclk-offers")
             self.assertIn("failed", err.getvalue())
             self.assertIn("503", err.getvalue())
+            records = [
+                json.loads(line)
+                for line in (Path(directory) / runner.DEALS_LOG_NAME).read_text().splitlines()
+            ]
+            self.assertEqual(len(records), 2)  # one per attempt; the loop kept going
+            self.assertEqual({r["outcome"] for r in records}, {"failed"})
+            self.assertEqual(records[0]["reason"], "lock: 503 Service Unavailable")
+            self.assertEqual(records[0]["room"], "tclk-offers")
+            self.assertTrue(records[0]["ts"].endswith("Z"))
+
+    def test_run_deal_loop_records_a_timed_out_deal(self):
+        with tempfile.TemporaryDirectory() as directory:
+            script = self._staged_deal_script(directory)
+            with patch.object(runner, "DEAL_SCRIPT", script), patch.object(
+                runner.shutil, "which", return_value="/usr/bin/node"
+            ), patch.object(
+                runner.subprocess, "run",
+                side_effect=runner.subprocess.TimeoutExpired(["node"], 240),
+            ), patch.object(
+                runner.time, "sleep", side_effect=KeyboardInterrupt
+            ), patch("sys.stderr", new=io.StringIO()):
+                with self.assertRaises(KeyboardInterrupt):
+                    runner.run_deal_loop(600.0, "tclk-offers")
+            record = json.loads((Path(directory) / runner.DEALS_LOG_NAME).read_text())
+            self.assertEqual(record["outcome"], "failed")
+            self.assertIn("timed out", record["reason"])
+
+    def test_run_deal_loop_waits_out_the_interval_since_the_newest_record(self):
+        with tempfile.TemporaryDirectory() as directory:
+            script = self._staged_deal_script(directory)
+            recent = runner.utc_timestamp(runner.time.time() - 3600)
+            (Path(directory) / runner.DEALS_LOG_NAME).write_text(
+                json.dumps({"ts": recent, "outcome": "completed"}) + "\n"
+            )
+            with patch.object(runner, "DEAL_SCRIPT", script), patch.object(
+                runner.shutil, "which", return_value="/usr/bin/node"
+            ), patch.object(runner.subprocess, "run") as run, patch.object(
+                runner.time, "sleep", side_effect=KeyboardInterrupt
+            ) as sleep, patch("sys.stderr", new=io.StringIO()):
+                with self.assertRaises(KeyboardInterrupt):
+                    runner.run_deal_loop(6 * 3600.0, "tclk-offers")
+            run.assert_not_called()
+            self.assertAlmostEqual(sleep.call_args.args[0], 5 * 3600.0, delta=5)
+
+    def test_first_deal_delay_reads_the_newest_valid_record(self):
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / runner.DEALS_LOG_NAME
+            now = 1_800_000_000.0
+            self.assertEqual(runner.first_deal_delay(log, 21600.0, now), 0.0)
+            log.write_text(
+                json.dumps({"ts": runner.utc_timestamp(now - 3600)}) + "\n" + "not json\n"
+            )
+            self.assertAlmostEqual(runner.first_deal_delay(log, 21600.0, now), 18000.0, places=2)
+            log.write_text(json.dumps({"ts": "2026-11-10T12:51:38.123Z"}) + "\n")
+            self.assertEqual(
+                runner.last_deal_time(log),
+                datetime(2026, 11, 10, 12, 51, 38, 123000, tzinfo=timezone.utc).timestamp(),
+            )
+            log.write_text(json.dumps({"ts": runner.utc_timestamp(now - 7 * 3600)}) + "\n")
+            self.assertEqual(runner.first_deal_delay(log, 21600.0, now), 0.0)
+            log.write_text(json.dumps({"ts": runner.utc_timestamp(now + 86400)}) + "\n")
+            self.assertEqual(runner.first_deal_delay(log, 21600.0, now), 21600.0)
 
 
 class RetainedSignatureTests(unittest.TestCase):
@@ -1384,6 +1502,56 @@ class AirdropWatchTests(unittest.TestCase):
         self.assertEqual(seen["https://api.github.com/x"], "Bearer t0k")
         self.assertIsNone(seen["https://technocore.chat/llms.txt"])
 
+    def test_npm_normaliser_reads_versions_and_not_published(self):
+        packument = json.dumps({
+            "dist-tags": {"latest": "0.2.0"},
+            "versions": {"0.1.0": {}, "0.2.0": {}},
+            "time": {"created": "2026-09-01T16:28:38Z", "0.1.0": "2026-09-01T16:28:38Z",
+                     "0.2.0": "2026-12-01T09:00:00Z"},
+        })
+        self.assertEqual(
+            watch.normalise("npm", packument),
+            ["dist-tag latest 0.2.0", "version 0.1.0 2026-09-01", "version 0.2.0 2026-12-01"],
+        )
+        self.assertEqual(
+            watch.normalise("npm", '{"error":"Not found"}'), [watch.NPM_NOT_PUBLISHED]
+        )
+        unpublished = json.dumps({"time": {"unpublished": {"time": "2026-12-02T00:00:00Z"}}})
+        self.assertEqual(watch.normalise("npm", unpublished), [watch.NPM_NOT_PUBLISHED])
+        with self.assertRaises(ValueError):
+            watch.normalise("npm", '{"error":"service unavailable"}')
+
+    def test_fetch_returns_the_registry_404_body_but_raises_other_404s(self):
+        def not_found(request, timeout):
+            raise HTTPError(request.full_url, 404, "Not Found", {},
+                            io.BytesIO(b'{"error":"Not found"}'))
+
+        with patch.object(watch, "urlopen", side_effect=not_found):
+            body = watch.fetch_text("https://registry.npmjs.org/@flop-labs%2ftclk-flop")
+            self.assertEqual(watch.normalise("npm", body), [watch.NPM_NOT_PUBLISHED])
+            with self.assertRaises(HTTPError):
+                watch.fetch_text("https://technocore.chat/llms.txt")
+
+    def test_tclk_flop_publish_is_priority_even_before_the_first_pass(self):
+        source = next(s for s in watch.SOURCES if s.name == "npm @flop-labs/tclk-flop")
+        published = json.dumps({"dist-tags": {"latest": "0.1.0"}, "versions": {"0.1.0": {}},
+                                "time": {"0.1.0": "2026-12-01T00:00:00Z"}})
+        # Still unpublished on the first pass: quiet.
+        state = {}
+        self.assertIsNone(watch.check_source(source, state, lambda url: '{"error":"Not found"}'))
+        event = watch.check_source(source, state, lambda url: published)
+        self.assertTrue(event["priority"])
+        self.assertEqual(event["keywords"], [])
+        self.assertIn("version 0.1.0 2026-12-01", event["added"])
+        # Already published when the watcher first runs: still reported, not baselined.
+        event = watch.check_source(source, {}, lambda url: published)
+        self.assertIsNotNone(event)
+        self.assertTrue(event["priority"])
+        # The pinned dependencies stay ordinary, keyword-driven sources.
+        tclk = next(s for s in watch.SOURCES if s.name == "npm @flop-labs/tclk")
+        self.assertFalse(tclk.priority)
+        self.assertIsNone(watch.check_source(tclk, {}, lambda url: published))
+
     def test_runner_reads_the_watch_interval(self):
         self.assertIsNone(runner.watch_loop_interval({}))
         self.assertEqual(runner.watch_loop_interval({"TECHNOCORE_WATCH_INTERVAL": "1800"}), 1800.0)
@@ -1447,6 +1615,50 @@ class ConfigurationTests(unittest.TestCase):
                 self.assertEqual(os.environ["GROQ_API_KEY"], "existing")
                 self.assertEqual(os.environ["GEMINI_API_KEY"], "quoted-value")
                 self.assertEqual(os.environ["LITERAL"], "$(not-executed)")
+
+    @unittest.skipIf(runner.fcntl is None, "flock is POSIX-only")
+    def test_runner_lock_refuses_a_second_runner_until_released(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / ".technocore-runner.lock"
+            first = runner.acquire_runner_lock(path)
+            try:
+                with self.assertRaisesRegex(
+                    agent.LocalFileError, f"already running \\(pid {os.getpid()}\\)"
+                ):
+                    runner.acquire_runner_lock(path)
+            finally:
+                first.close()
+            runner.acquire_runner_lock(path).close()
+
+    def test_identity_from_keyring_flag(self):
+        self.assertFalse(runner.identity_from_keyring({}))
+        self.assertTrue(runner.identity_from_keyring({"TECHNOCORE_IDENTITY_KEYRING": "1"}))
+        self.assertFalse(runner.identity_from_keyring({"TECHNOCORE_IDENTITY_KEYRING": "off"}))
+        with self.assertRaises(agent.ProtocolError):
+            runner.identity_from_keyring({"TECHNOCORE_IDENTITY_KEYRING": "maybe"})
+
+    def test_keyring_passphrase_reads_secret_tool_without_trailing_newline(self):
+        result = SimpleNamespace(returncode=0, stdout=b"correct horse battery\n", stderr=b"")
+        with patch.object(
+            runner.shutil, "which", return_value="/usr/bin/secret-tool"
+        ), patch.object(runner.subprocess, "run", return_value=result) as run:
+            secret = runner.keyring_passphrase(Path("identity.pem"))
+        self.assertEqual(secret, b"correct horse battery")
+        self.assertEqual(
+            run.call_args.args[0],
+            ["/usr/bin/secret-tool", "lookup", "service", "technocore", "key", "identity.pem"],
+        )
+
+    def test_keyring_passphrase_explains_how_to_store_a_missing_entry(self):
+        result = SimpleNamespace(returncode=1, stdout=b"", stderr=b"")
+        with patch.object(
+            runner.shutil, "which", return_value="/usr/bin/secret-tool"
+        ), patch.object(runner.subprocess, "run", return_value=result):
+            with self.assertRaisesRegex(agent.IdentityError, "secret-tool store"):
+                runner.keyring_passphrase(Path("identity.pem"))
+        with patch.object(runner.shutil, "which", return_value=None):
+            with self.assertRaisesRegex(agent.IdentityError, "libsecret-tools"):
+                runner.keyring_passphrase(Path("identity.pem"))
 
     def test_runner_rejects_invalid_env_lines(self):
         with tempfile.TemporaryDirectory() as directory:

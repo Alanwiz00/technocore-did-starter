@@ -2,7 +2,8 @@
 """Read-only monitor for official FLOP / Technocore signals.
 
 Polls a fixed allowlist of official sources (the flop-labs GitHub org, the live
-technocore.chat protocol documents, flop.finance), diffs each against its last
+technocore.chat protocol documents, flop.finance, the @flop-labs npm packages
+the deal loop depends on), diffs each against its last
 snapshot, and reports what changed, flagging anything that mentions a faucet,
 testnet, airdrop, snapshot or claim. It never writes to any of those services
 and never touches a key, seed or passphrase.
@@ -30,7 +31,7 @@ from datetime import datetime, timezone
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Callable
-from urllib.error import URLError
+from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 import technocore_agent as agent
@@ -51,13 +52,20 @@ PRIORITY_PATTERN = re.compile(
 
 GITHUB_API = "https://api.github.com"
 TECHNOCORE = "https://technocore.chat"
+NPM_REGISTRY = "https://registry.npmjs.org"
+NPM_NOT_PUBLISHED = "not published on npm"
 
 
 @dataclass(frozen=True)
 class Source:
     name: str
     url: str
-    kind: str  # repos | releases | commits | text | html
+    kind: str  # repos | releases | commits | text | html | npm
+    # Every change is PRIORITY, keywords or not.
+    priority: bool = False
+    # The snapshot assumed before the first pass, so a change that lands before the
+    # watcher first runs is still reported rather than silently becoming the baseline.
+    baseline: tuple[str, ...] | None = None
 
 
 SOURCES: tuple[Source, ...] = (
@@ -75,6 +83,13 @@ SOURCES: tuple[Source, ...] = (
     Source("technocore config", f"{TECHNOCORE}/config", "text"),
     Source("flop.finance", "https://flop.finance/", "html"),
     Source("flop.finance teaser", "https://flop.finance/teaser/", "html"),
+    # The value-bearing HTLC rail (tclk #210) ships as this separate package. Its
+    # publication is the cue to review the deal loop, which is PaperRail-only by design.
+    Source("npm @flop-labs/tclk-flop", f"{NPM_REGISTRY}/@flop-labs%2ftclk-flop", "npm",
+           priority=True, baseline=(NPM_NOT_PUBLISHED,)),
+    # Pinned exactly in package.json; a new version means a deliberate review + bump.
+    # (tclk-mcp is no longer a dependency: its signing helpers are vendored.)
+    Source("npm @flop-labs/tclk", f"{NPM_REGISTRY}/@flop-labs%2ftclk", "npm"),
 )
 
 
@@ -109,8 +124,15 @@ def fetch_text(url: str, *, token: str | None = None) -> str:
     }
     if token and url.startswith(GITHUB_API + "/"):
         headers["Authorization"] = f"Bearer {token}"
-    with urlopen(Request(url, headers=headers), timeout=FETCH_TIMEOUT_SECONDS) as response:
-        raw = response.read(MAX_FETCH_BYTES + 1)
+    try:
+        with urlopen(Request(url, headers=headers), timeout=FETCH_TIMEOUT_SECONDS) as response:
+            raw = response.read(MAX_FETCH_BYTES + 1)
+    except HTTPError as error:
+        # For the registry a 404 is a state ("not published yet"), not a failure:
+        # hand its {"error":"Not found"} body to normalise() like any other answer.
+        if error.code == 404 and url.startswith(NPM_REGISTRY + "/"):
+            return error.read(64 * 1024).decode("utf-8", errors="replace")
+        raise
     if len(raw) > MAX_FETCH_BYTES:
         raise ValueError("response exceeded the size limit")
     return raw.decode("utf-8", errors="replace")
@@ -143,6 +165,20 @@ def normalise(kind: str, body: str) -> list[str]:
             f"{str(item['commit']['message']).splitlines()[0] if item['commit']['message'] else ''}"
             for item in _json_list(body)
         ]
+    elif kind == "npm":
+        data = json.loads(body)
+        if not isinstance(data, dict):
+            raise ValueError("unexpected registry response")
+        versions = data.get("versions")
+        if not versions:
+            error = str(data.get("error", ""))
+            # Never published (404), or every version unpublished since.
+            if error.lower().startswith("not found") or "unpublished" in (data.get("time") or {}):
+                return [NPM_NOT_PUBLISHED]
+            raise ValueError(error[:120] or "registry response without versions")
+        published = data.get("time") or {}
+        lines = [f"dist-tag {tag} {version}" for tag, version in sorted((data.get("dist-tags") or {}).items())]
+        lines += [f"version {version} {str(published.get(version, ''))[:10]}".rstrip() for version in versions]
     elif kind == "html":
         parser = _VisibleText()
         parser.feed(body)
@@ -192,6 +228,8 @@ def check_source(
     entry["fails"] = 0
     entry["checked_at"] = _now()
     previous = entry.get("lines")
+    if previous is None and source.baseline is not None:
+        previous = list(source.baseline)
     entry["lines"] = lines
     if previous is None or previous == lines:
         return None
@@ -201,7 +239,7 @@ def check_source(
         "ts": _now(),
         "source": source.name,
         "url": source.url,
-        "priority": bool(keywords),
+        "priority": source.priority or bool(keywords),
         "keywords": keywords,
         "added_total": len(added),
         "removed_total": len(removed),

@@ -1,18 +1,19 @@
 {
   "name": "technocore-did-starter",
-  "version": "1.11.0",
+  "version": "1.12.0",
   "private": true,
   "description": "Operational scripts for the Technocore Python agent",
   "scripts": {
     "start": "node scripts/python.js technocore_runner.py",
-    "test": "node scripts/python.js -m unittest discover -s tests -v",
-    "check": "node scripts/python.js -m compileall -q technocore_agent.py technocore_runner.py airdrop_watch.py tests && node scripts/python.js -m unittest discover -s tests -v"
+    "test": "node --test tclk-signing.test.mjs && node scripts/python.js -m unittest discover -s tests -v",
+    "check": "node --check deal.mjs && node --check tclk-signing.mjs && node scripts/python.js -m compileall -q technocore_agent.py technocore_runner.py airdrop_watch.py tests && node --test tclk-signing.test.mjs && node scripts/python.js -m unittest discover -s tests -v"
   },
   "engines": {
     "node": ">=18"
   },
   "dependencies": {
-    "@flop-labs/tclk": "^0.1.0",
-    "@flop-labs/tclk-mcp": "^0.1.0"
+    "@flop-labs/tclk": "0.1.0",
+    "@noble/curves": "2.4.0",
+    "@scure/base": "2.4.0"
   }
 }

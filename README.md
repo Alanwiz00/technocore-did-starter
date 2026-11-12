@@ -219,7 +219,7 @@ npm test
 
 ```text
 Python 3.12.x
-1.11.0
+1.12.0
 ```
 
 The cryptography command prints `50.0.0` on Windows, Linux, and Apple silicon
@@ -715,11 +715,14 @@ room's only access control — anyone who can read this config can post there.
 **Airdrop watch (optional, read-only).** With `TECHNOCORE_WATCH_INTERVAL=<seconds>`
 set, `npm start` runs `airdrop_watch.py`, which checks the official sources —
 the `flop-labs` GitHub org (repos, `technocore-chat` releases, `yellowpaper`,
-`tclk` and the sonnet challenge), the live `technocore.chat` protocol documents
-and `flop.finance` — against their last snapshot and prints `[watch]` alerts for
+`tclk` and the sonnet challenge), the live `technocore.chat` protocol documents,
+`flop.finance`, and the npm registry entries for `@flop-labs/tclk` and
+`tclk-flop` — against their last snapshot and prints `[watch]` alerts for
 anything that changed. New text mentioning a faucet, testnet, airdrop, snapshot or
 claim is flagged `PRIORITY` (and raises a desktop notification where
-`notify-send` exists). The first pass only records a baseline; events append to
+`notify-send` exists). Any change to `@flop-labs/tclk-flop` is always `PRIORITY`.
+That package is the value-bearing HTLC rail, and its publication is the cue to
+review the deal loop. The first pass only records a baseline; events append to
 `.technocore-watch-events.jsonl`. It never writes to those services. Run one pass
 by hand with `python airdrop_watch.py --once`. `@flop_labs` on X can't be read
 without an account, so follow it directly as well.
@@ -735,7 +738,54 @@ in `tclk-offers` by default (`TECHNOCORE_DEAL_ROOM` to change) as the two
 throwaway keys and `deal.mjs` refuses a key that has signed anything in your
 contribution ledger. `PaperRail` settles nothing (no value-bearing rail exists
 yet); this produces independently re-auditable protocol activity, not yield. Run
-one by hand with `node deal.mjs <room>`.
+one by hand with `node deal.mjs <room>`. The cadence survives restarts: the first
+deal waits out whatever remains of the interval since the newest record. A deal
+that fails or times out is recorded as `{"outcome":"failed","reason":…}`; completed
+runs carry `"outcome":"completed"` (records before v1.12.0 have no `outcome` and
+are all completed). Uploads that get a 408 or never connect are resent unchanged,
+and reads retry 429/5xx. Dependencies are pinned to exact versions; bump them
+deliberately. The signing helpers (`tclk-signing.mjs`) are vendored from
+`@flop-labs/tclk-mcp` 0.1.0 (Apache-2.0). That package's MCP server half pulled in
+the MCP SDK and a zod with an unfixable advisory, none of it needed to sign.
+`tclk-signing.test.mjs` pins the copy to a known-answer vector, and `npm test`
+runs it.
+
+The parties are deliberately **not linked** to your contribution identity: no
+`delegate:` record in your DID note, and the guard above keeps your key out of
+`parties.json`. Two keys under one owner dealing with each other would read as
+self-dealing, and nothing published says paper deals count for anything. Revisit
+when the watcher flags `@flop-labs/tclk-flop` or a testnet. The protocol's
+scoped, expiring `delegate:` records (see `/llms.txt`, DELEGATION) are the way
+to link them then.
+
+Only one runner may run per checkout: a second `npm start` exits with
+`another Technocore runner is already running (pid …)` rather than doubling every
+post and deal under the same identity.
+
+### Run as a service (Linux, systemd)
+
+`npm start` only runs while a terminal holds it. To start the runner at login and
+restart it after a crash, install the user unit in `scripts/technocore.service`.
+It has no terminal to prompt on, so it reads the identity passphrase from the
+login keyring (GNOME Keyring / Secret Service) via `secret-tool`. That keeps the
+passphrase encrypted under your login password, and it never enters the
+environment, so child processes don't inherit it. One-time setup:
+
+```console
+sudo apt install libsecret-tools
+secret-tool store --label='Technocore identity passphrase' service technocore key identity.pem
+cp scripts/technocore.service ~/.config/systemd/user/
+systemctl --user daemon-reload && systemctl --user enable --now technocore
+journalctl --user -u technocore -f
+```
+
+`secret-tool store` prompts for the passphrase itself. Don't pipe it in, or it
+lands in your shell history. The unit sets `TECHNOCORE_IDENTITY_KEYRING=1`; set
+that in `.env` too if you want `npm start` to use the keyring rather than prompt.
+The unit assumes the checkout is at `~/repo/technocore-did-starter` and that node
+comes from nvm; edit `WorkingDirectory`/`ExecStart` otherwise. It starts at login,
+not at boot. For boot, run `loginctl enable-linger`, but then the keyring may
+still be locked when it starts.
 
 ### Template-only preview
 

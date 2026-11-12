@@ -32,7 +32,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import (
     Ed25519PublicKey,
 )
 
-APP_VERSION = "1.11.0"
+APP_VERSION = "1.12.0"
 DEFAULT_BASE_URL = "https://technocore.chat"
 DEFAULT_KEY_PATH = Path("identity.pem")
 DEFAULT_TIMEOUT_SECONDS = 20.0
@@ -702,6 +702,16 @@ def request_json(
                 raise NonceRejectedError(
                     f"Technocore rejected a stale nonce: {detail}", rejected
                 ) from None
+        if error.code == 408:
+            # The body missed the server's total upload deadline (/llms.txt: "A 408
+            # states the deadline and closes the connection; retry on a new
+            # connection"). An unread body was never processed, so even a signed
+            # write is safe to resend with the same nonce; urllib opens a fresh
+            # connection per request.
+            raise RetryableNetworkError(
+                f"Technocore timed out receiving the upload (HTTP 408): {detail}",
+                DEFAULT_TRANSPORT_RETRY_SECONDS,
+            ) from None
         if not is_write and (error.code == 429 or 500 <= error.code <= 599):
             retry_after = 5.0
             try:
@@ -834,9 +844,11 @@ def post_signed_message(
     names its last-used nonce, so retry up to ``nonce_retries`` times, each time
     counting up past the value the server reported.
 
-    A transport failure that proves the request never left this host (no route,
-    DNS failure, connection refused) is retried with the same nonce up to
-    ``transport_retries`` times, with the shared jittered backoff.
+    A failure that proves the write was never processed — a transport error
+    before the request left this host (no route, DNS failure, connection
+    refused), or HTTP 408 for an upload that missed the server's body deadline —
+    is retried with the same nonce up to ``transport_retries`` times, with the
+    shared jittered backoff.
     """
     for name, value in (
         ("nonce_retries", nonce_retries),
